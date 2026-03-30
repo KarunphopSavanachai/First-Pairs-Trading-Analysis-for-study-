@@ -32,7 +32,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from autobrain_sim import BrainClient
+from brain_client import BrainClient
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -479,9 +479,8 @@ def run(
     resume: bool,
 ) -> None:
     creds  = load_credentials(credentials)
-    client = BrainClient.login(
-        email=creds["username"], password=creds["password"]
-    )
+    client = BrainClient(email=creds["username"], password=creds["password"])
+    client.authenticate()
     log.info("Authentication successful.")
 
     engine = TemplateEngine(template)
@@ -715,9 +714,8 @@ def main() -> None:
     # ── Test-auth mode ────────────────────────────────────────────────────────
     if args.test_auth:
         creds  = load_credentials(args.credentials)
-        client = BrainClient.login(
-            email=creds["username"], password=creds["password"]
-        )
+        client = BrainClient(email=creds["username"], password=creds["password"])
+        client.authenticate()
         log.info("Authentication successful.")
         r = client.session.get(
             f"{BRAIN_BASE}/data-fields",
