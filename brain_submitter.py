@@ -32,7 +32,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from brain_client import BrainClient, SimulationResult
+from brain_client import BrainClient
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -133,7 +133,56 @@ def build_client(credentials: Optional[str]) -> BrainClient:
     return client
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. STATE DATABASE
+# 4. SIMULATION POLLER  (polls progress_url stored in the state DB)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def poll_simulation(
+    client: BrainClient,
+    progress_url: str,
+    poll_interval: int = 15,
+    timeout: int = 600,
+) -> Optional[Dict]:
+    """Poll a simulation progress URL until COMPLETE or timeout.
+
+    Uses only the documented client.session attribute.
+    Returns the result dict on success, None on error/timeout.
+    Raises ValueError if progress_url is empty.
+    """
+    if not progress_url:
+        raise ValueError("progress_url is empty — cannot poll simulation")
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = client.session.get(progress_url)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 60))
+                log.warning("Rate limited while polling. Waiting %ds ...", wait)
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            log.warning("Poll error (%s): %s", progress_url.split("/")[-1], e)
+            time.sleep(poll_interval)
+            continue
+
+        status = data.get("status", "")
+        if status == "COMPLETE":
+            return data
+        if status in ("ERROR", "CANCELLED"):
+            log.warning(
+                "Simulation %s ended with status=%s",
+                progress_url.split("/")[-1], status,
+            )
+            return None
+        time.sleep(poll_interval)
+
+    log.warning("Simulation timed out: %s", progress_url.split("/")[-1])
+    return None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. STATE DATABASE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class StateDB:
@@ -564,17 +613,14 @@ def _run_inner(
         fid          = row["field_id"]
 
         log.info("Polling simulation for field %s ...", fid)
-        try:
-            sim_obj = SimulationResult(client.session, progress_url)
-            sim_obj.wait(verbose=False)
-            alpha    = sim_obj.get_alpha()
-            alpha_id = sim_obj.alpha_id or ""
-        except Exception as e:
-            log.warning("Simulation failed for %s: %s", fid, e)
-            db.mark_failed(expr, str(e))
+        result = poll_simulation(client, progress_url, poll_interval, timeout)
+
+        if result is None:
+            db.mark_failed(expr, "timeout_or_error")
             continue
 
-        metrics  = parse_metrics(alpha)
+        metrics  = parse_metrics(result)
+        alpha_id = result.get("id") or result.get("alphaId") or ""
         sharpe   = metrics.get("sharpe")  or 0.0
         fitness  = metrics.get("fitness") or 0.0
         passed   = sharpe >= min_sharpe and fitness >= min_fitness
