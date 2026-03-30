@@ -32,7 +32,7 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from brain_client import BrainClient
+from brain_client import BrainClient, SimulationResult
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -113,52 +113,24 @@ def get_data_fields(
     return fields
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. SIMULATION POLLER  (polls progress_url stored in the state DB)
+# 3. AUTH HELPER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def poll_simulation(
-    client: BrainClient,
-    progress_url: str,
-    poll_interval: int = 15,
-    timeout: int = 600,
-) -> Optional[Dict]:
-    """Poll a simulation progress URL until COMPLETE or timeout.
+def build_client(credentials: Optional[str]) -> BrainClient:
+    """Create and authenticate a BrainClient.
 
-    Returns the result dict on success, None on error/timeout.
-    Raises ValueError if progress_url is empty (programming error).
+    If credentials path is given, reads {"username", "password"} from the JSON
+    file and passes them directly.  Otherwise autobrain-sim's own priority chain
+    applies: ~/.brain_credentials → interactive prompt.
     """
-    if not progress_url:
-        raise ValueError("progress_url is empty — cannot poll simulation")
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            r = client.session.get(progress_url)
-            if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", 60))
-                log.warning("Rate limited while polling. Waiting %ds ...", wait)
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            log.warning("Poll error (%s): %s", progress_url.split("/")[-1], e)
-            time.sleep(poll_interval)
-            continue
-
-        status = data.get("status", "")
-        if status == "COMPLETE":
-            return data
-        if status in ("ERROR", "CANCELLED"):
-            log.warning(
-                "Simulation %s ended with status=%s",
-                progress_url.split("/")[-1], status,
-            )
-            return None
-        time.sleep(poll_interval)
-
-    log.warning("Simulation timed out: %s", progress_url.split("/")[-1])
-    return None
+    if credentials:
+        creds  = load_credentials(credentials)
+        client = BrainClient(email=creds["username"], password=creds["password"])
+    else:
+        client = BrainClient()  # reads ~/.brain_credentials or prompts
+    client.authenticate()
+    log.info("Authentication successful.")
+    return client
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. STATE DATABASE
@@ -462,7 +434,7 @@ def _write_sheet(ws, rows: list, min_sharpe: float, min_fitness: float) -> None:
 
 def run(
     template: str,
-    credentials: str,
+    credentials: Optional[str],
     universe: str,
     region: str,
     neutralization: str,
@@ -478,11 +450,7 @@ def run(
     db_path: str,
     resume: bool,
 ) -> None:
-    creds  = load_credentials(credentials)
-    client = BrainClient(email=creds["username"], password=creds["password"])
-    client.authenticate()
-    log.info("Authentication successful.")
-
+    client = build_client(credentials)
     engine = TemplateEngine(template)
     db     = StateDB(db_path)
 
@@ -596,14 +564,17 @@ def _run_inner(
         fid          = row["field_id"]
 
         log.info("Polling simulation for field %s ...", fid)
-        result = poll_simulation(client, progress_url, poll_interval, timeout)
-
-        if result is None:
-            db.mark_failed(expr, "timeout_or_error")
+        try:
+            sim_obj = SimulationResult(client.session, progress_url)
+            sim_obj.wait(verbose=False)
+            alpha    = sim_obj.get_alpha()
+            alpha_id = sim_obj.alpha_id or ""
+        except Exception as e:
+            log.warning("Simulation failed for %s: %s", fid, e)
+            db.mark_failed(expr, str(e))
             continue
 
-        metrics  = parse_metrics(result)
-        alpha_id = result.get("id") or result.get("alphaId") or ""
+        metrics  = parse_metrics(alpha)
         sharpe   = metrics.get("sharpe")  or 0.0
         fitness  = metrics.get("fitness") or 0.0
         passed   = sharpe >= min_sharpe and fitness >= min_fitness
@@ -653,8 +624,15 @@ def main() -> None:
         help='Alpha expression with {DATA} placeholder, e.g. "ts_rank({DATA},10)"',
     )
     p.add_argument(
-        "--credentials", default="credentials.json",
-        help="Path to JSON file with {username, password}",
+        "--credentials", default=None,
+        help=(
+            "Path to JSON file with {username, password}. "
+            "If omitted, autobrain-sim reads ~/.brain_credentials or prompts interactively."
+        ),
+    )
+    p.add_argument(
+        "--interactive", action="store_true",
+        help="Force interactive credential prompt (ignores --credentials)",
     )
     p.add_argument("--universe",        default="TOP3000")
     p.add_argument("--region",          default="USA")
@@ -711,12 +689,12 @@ def main() -> None:
 
     args = p.parse_args()
 
+    # --interactive overrides --credentials
+    credentials = None if args.interactive else args.credentials
+
     # ── Test-auth mode ────────────────────────────────────────────────────────
     if args.test_auth:
-        creds  = load_credentials(args.credentials)
-        client = BrainClient(email=creds["username"], password=creds["password"])
-        client.authenticate()
-        log.info("Authentication successful.")
+        client = build_client(credentials)
         r = client.session.get(
             f"{BRAIN_BASE}/data-fields",
             params={
@@ -737,7 +715,7 @@ def main() -> None:
 
     run(
         template         = args.template,
-        credentials      = args.credentials,
+        credentials      = credentials,
         universe         = args.universe,
         region           = args.region,
         neutralization   = args.neutralization,
