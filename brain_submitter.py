@@ -330,11 +330,12 @@ class TemplateEngine:
             self.mode         = "single"
         else:
             raise ValueError(
-                "Template must contain {DATA} (single placeholder) "
-                "or {DATA1}, {DATA2}, {DATA3} (multiple placeholders).\n"
+                "Template must contain {DATA} (single) or {DATA1},{DATA2},{DATA3} (multi).\n"
                 "Examples:\n"
-                '  "ts_rank({DATA}, 10)"\n'
-                '  "rank({DATA1}, 10) + rank({DATA2}, 5)"'
+                '  --template "ts_rank({DATA}, 10)"\n'
+                '  --template "rank({DATA1}, 10) + rank({DATA2}, 5)"\n'
+                "Shell tip: always wrap the template in double-quotes so your shell\n"
+                "does not strip or expand the { } characters."
             )
         self.template = template
 
@@ -722,8 +723,13 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
-        "--template", required=True,
-        help='Alpha expression with {DATA} placeholder, e.g. "ts_rank({DATA},10)"',
+        "--template", default=None,
+        help=(
+            'Alpha expression with {DATA} placeholder. '
+            'Always quote it to protect curly braces from the shell. '
+            'Examples:  "ts_rank({DATA},10)"  |  "rank({DATA1},10)+rank({DATA2},5)" '
+            '(required unless --test-auth is used)'
+        ),
     )
     p.add_argument(
         "--credentials", default=None,
@@ -790,6 +796,15 @@ def main() -> None:
     )
 
     args = p.parse_args()
+
+    # --template is required for normal runs but not for --test-auth
+    if not args.test_auth and not args.template:
+        p.error(
+            "--template is required.\n"
+            '  Example:  --template "ts_rank({DATA}, 10)"\n'
+            "  Tip: always wrap the template in double-quotes so the shell\n"
+            "  does not interpret { } as brace expansion."
+        )
 
     # --interactive overrides --credentials
     credentials = None if args.interactive else args.credentials
