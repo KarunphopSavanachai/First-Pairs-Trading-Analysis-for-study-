@@ -24,13 +24,15 @@ Usage:
 import argparse
 import csv
 import hashlib
+import itertools
 import json
 import logging
+import re
 import sqlite3
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from brain_client import BrainClient
 from openpyxl import Workbook
@@ -304,17 +306,58 @@ class StateDB:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TemplateEngine:
-    PLACEHOLDER = "{DATA}"
+    """Generates alpha expressions by substituting field IDs for placeholders.
+
+    Supported placeholder styles
+    ----------------------------
+    Single   : {DATA}            All occurrences replaced with the same field.
+                                 e.g. "ts_rank({DATA},10) / ts_mean({DATA},5)"
+    Numbered : {DATA1},{DATA2},… Each replaced with a different field ID.
+                                 All combinations are generated automatically.
+                                 e.g. "rank({DATA1},10) + rank({DATA2},5)"
+    """
+
+    _SINGLE   = "{DATA}"
+    _NUMBERED = re.compile(r'\{DATA\d+\}')
 
     def __init__(self, template: str):
-        if self.PLACEHOLDER not in template:
+        numbered = sorted(set(self._NUMBERED.findall(template)))
+        if numbered:
+            self.placeholders = numbered          # e.g. ['{DATA1}', '{DATA2}']
+            self.mode         = "multi"
+        elif self._SINGLE in template:
+            self.placeholders = [self._SINGLE]
+            self.mode         = "single"
+        else:
             raise ValueError(
-                f"Template must contain the placeholder '{self.PLACEHOLDER}'"
+                "Template must contain {DATA} (single placeholder) "
+                "or {DATA1}, {DATA2}, {DATA3} (multiple placeholders).\n"
+                "Examples:\n"
+                '  "ts_rank({DATA}, 10)"\n'
+                '  "rank({DATA1}, 10) + rank({DATA2}, 5)"'
             )
         self.template = template
 
-    def generate(self, field_id: str) -> str:
-        return self.template.replace(self.PLACEHOLDER, field_id)
+    def generate(self, *field_ids: str) -> str:
+        """Replace each placeholder with the corresponding field ID."""
+        expr = self.template
+        for ph, fid in zip(self.placeholders, field_ids):
+            expr = expr.replace(ph, fid)
+        return expr
+
+    def all_combinations(
+        self, fields: List[str]
+    ) -> List[Tuple[str, List[str]]]:
+        """Return (expression, [field_ids]) for every combination.
+
+        Single mode      →  N   pairs  (one per field)
+        2 placeholders   →  N²  pairs  (cartesian product)
+        3 placeholders   →  N³  pairs
+        """
+        results: List[Tuple[str, List[str]]] = []
+        for combo in itertools.product(fields, repeat=len(self.placeholders)):
+            results.append((self.generate(*combo), list(combo)))
+        return results
 
     def validate(self, expr: str) -> tuple:
         """Basic syntax validation before sending to BRAIN."""
@@ -554,16 +597,29 @@ def _run_inner(
             delay=delay,
             category=field_category,
         )
-        for f in fields:
-            fid = f.get("id") or f.get("fieldId", "")
-            if not fid:
-                continue
-            expr = engine.generate(fid)
+        field_ids = [
+            fid for f in fields
+            if (fid := f.get("id") or f.get("fieldId", ""))
+        ]
+        n_combos = len(field_ids) ** len(engine.placeholders)
+        if len(engine.placeholders) > 1:
+            log.info(
+                "%d fields x %d placeholders = %d combinations to enqueue.",
+                len(field_ids), len(engine.placeholders), n_combos,
+            )
+            if n_combos > 1000:
+                log.warning(
+                    "%d combinations is very large. Consider using --category "
+                    "to filter data fields and keep runtime manageable.",
+                    n_combos,
+                )
+
+        for expr, fids in engine.all_combinations(field_ids):
             ok, reason = engine.validate(expr)
             if not ok:
-                log.debug("Skip %s: %s", fid, reason)
+                log.debug("Skip %s: %s", fids, reason)
                 continue
-            db.upsert_pending(expr, fid)
+            db.upsert_pending(expr, "|".join(fids))
         log.info("Enqueued %d expressions.", len(db.pending()))
     else:
         log.info("Resuming -- %d pending expressions in DB.", len(db.pending()))
