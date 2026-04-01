@@ -81,7 +81,7 @@ def get_data_fields(
 ) -> List[Dict]:
     """Return all available data fields matching the given settings."""
     fields: List[Dict] = []
-    offset, limit = 0, 100
+    offset, limit = 0, 20
 
     while True:
         params: Dict = {
