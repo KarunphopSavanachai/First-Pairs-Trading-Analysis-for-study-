@@ -87,8 +87,6 @@ def get_data_fields(
         params: Dict = {
             "instrumentType": instrument_type,
             "region": region,
-            "universe": universe,
-            "delay": delay,
             "limit": limit,
             "offset": offset,
         }
@@ -101,6 +99,8 @@ def get_data_fields(
             log.warning("Rate limited fetching data fields. Waiting %ds ...", wait)
             time.sleep(wait)
             continue
+        if r.status_code == 400:
+            log.error("data-fields 400 error. Response: %s", r.text)
         r.raise_for_status()
 
         page = r.json()
@@ -831,8 +831,6 @@ def main() -> None:
             params={
                 "instrumentType": args.instrument_type,
                 "region":         args.region,
-                "universe":       args.universe,
-                "delay":          args.delay,
                 "limit":          1,
             },
         )
