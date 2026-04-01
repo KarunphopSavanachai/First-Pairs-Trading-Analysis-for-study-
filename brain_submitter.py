@@ -86,9 +86,12 @@ def get_data_fields(
     while True:
         params: Dict = {
             "instrumentType": instrument_type,
-            "region": region,
-            "limit": limit,
-            "offset": offset,
+            "region":         region,
+            "universe":       universe,
+            "delay":          delay,
+            "language":       "FASTEXPR",
+            "limit":          limit,
+            "offset":         offset,
         }
         if category:
             params["category"] = category
@@ -831,9 +834,14 @@ def main() -> None:
             params={
                 "instrumentType": args.instrument_type,
                 "region":         args.region,
+                "universe":       args.universe,
+                "delay":          args.delay,
+                "language":       "FASTEXPR",
                 "limit":          1,
             },
         )
+        if r.status_code == 400:
+            log.error("data-fields 400 error. Response: %s", r.text)
         r.raise_for_status()
         total = r.json().get("count", "unknown")
         log.info(
