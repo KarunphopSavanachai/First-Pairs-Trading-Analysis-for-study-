@@ -95,7 +95,7 @@ def get_data_fields(
         if category:
             params["category"] = category
 
-        r = client.session.get(f"{BRAIN_BASE}/data-fields", params=params)
+        r = _get_session(client).get(f"{BRAIN_BASE}/data-fields", params=params)
         if r.status_code == 429:
             wait = int(r.headers.get("Retry-After", 60))
             log.warning("Rate limited fetching data fields. Waiting %ds ...", wait)
@@ -134,6 +134,20 @@ def build_client(credentials: Optional[str]) -> BrainClient:
     log.info("Authentication successful.")
     return client
 
+def _get_session(client: BrainClient):
+    """Return the underlying requests.Session from BrainClient.
+
+    Different versions of autobrain-sim expose it under different names.
+    """
+    for attr in ("session", "_session", "requests_session"):
+        s = getattr(client, attr, None)
+        if s is not None:
+            return s
+    raise AttributeError(
+        "Cannot find requests.Session on BrainClient. "
+        "Try: pip install --upgrade autobrain-sim"
+    )
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. SIMULATION POLLER  (polls progress_url stored in the state DB)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -156,7 +170,7 @@ def poll_simulation(
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            r = client.session.get(progress_url)
+            r = _get_session(client).get(progress_url)
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 60))
                 log.warning("Rate limited while polling. Waiting %ds ...", wait)
@@ -812,7 +826,7 @@ def main() -> None:
     # ── Test-auth mode ────────────────────────────────────────────────────────
     if args.test_auth:
         client = build_client(credentials)
-        r = client.session.get(
+        r = _get_session(client).get(
             f"{BRAIN_BASE}/data-fields",
             params={
                 "instrumentType": args.instrument_type,
