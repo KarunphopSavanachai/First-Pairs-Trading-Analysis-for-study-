@@ -89,8 +89,8 @@ def main() -> None:
         description="Fetch and cache WorldQuant BRAIN data fields to a JSON file.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--credentials",     default=None,
-                   help="Path to credentials JSON {username, password}")
+    p.add_argument("--credentials",     default="credentials.json",
+                   help="Path to credentials JSON {username, password} (default: credentials.json)")
     p.add_argument("--region",          default="USA")
     p.add_argument("--universe",        default="TOP3000")
     p.add_argument("--instrument-type", default="EQUITY")

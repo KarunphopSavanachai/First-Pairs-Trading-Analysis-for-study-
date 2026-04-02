@@ -772,10 +772,10 @@ def main() -> None:
         ),
     )
     p.add_argument(
-        "--credentials", default=None,
+        "--credentials", default="credentials.json",
         help=(
             "Path to JSON file with {username, password}. "
-            "If omitted, autobrain-sim reads ~/.brain_credentials or prompts interactively."
+            "Defaults to credentials.json in the current directory."
         ),
     )
     p.add_argument(
