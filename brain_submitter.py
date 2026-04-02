@@ -151,6 +151,34 @@ def _get_session(client: BrainClient):
         "Try: pip install --upgrade autobrain-sim"
     )
 
+def simulate_with_retry(client, expr: str, settings: dict, max_retries: int = 6):
+    """Call client.simulate() with automatic retry on HTTP 429."""
+    import requests as _requests
+    for attempt in range(max_retries + 1):
+        try:
+            return client.simulate(expr, settings=settings)
+        except _requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                wait = int(e.response.headers.get("Retry-After", 60))
+                log.warning(
+                    "Rate limited on submission (attempt %d/%d). Waiting %ds ...",
+                    attempt + 1, max_retries, wait,
+                )
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as e:
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                backoff = min(60 * (2 ** attempt), 600)
+                log.warning(
+                    "Rate limited (429) on submission (attempt %d/%d). Waiting %ds ...",
+                    attempt + 1, max_retries, backoff,
+                )
+                time.sleep(backoff)
+                continue
+            raise
+    raise RuntimeError(f"Max retries ({max_retries}) exceeded on simulate()")
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # 4. SIMULATION POLLER  (polls progress_url stored in the state DB)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -688,7 +716,7 @@ def _run_inner(
 
         log.info("[%d/%d] Submitting: %s", i, len(pending), expr[:80])
         try:
-            sim_result = client.simulate(expr, settings=sim_settings)
+            sim_result = simulate_with_retry(client, expr, settings=sim_settings)
             db.mark_submitted(expr, sim_result.progress_url)
         except Exception as e:
             log.error("Submit failed for %s: %s", fid, e)
