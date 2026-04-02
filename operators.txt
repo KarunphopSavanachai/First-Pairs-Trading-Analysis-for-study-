@@ -1,0 +1,27 @@
+# WorldQuant BRAIN Operator Templates
+# One template per line. Use {DATA} as the data field placeholder.
+# Lines starting with # are comments and are ignored.
+# The template_generator.py script reads this file to produce templates.txt.
+
+# ── Time-series operators ──────────────────────────────────────────────────────
+ts_rank({DATA}, 10)
+ts_rank({DATA}, 20)
+ts_rank({DATA}, 60)
+ts_mean({DATA}, 10)
+ts_mean({DATA}, 20)
+ts_std_dev({DATA}, 20)
+ts_zscore({DATA}, 20)
+delta({DATA}, 1)
+delta({DATA}, 5)
+delta({DATA}, 20)
+decay_linear({DATA}, 10)
+decay_linear({DATA}, 20)
+
+# ── Cross-sectional operators ──────────────────────────────────────────────────
+rank({DATA})
+zscore({DATA})
+scale({DATA})
+
+# ── Returns / log ──────────────────────────────────────────────────────────────
+log({DATA})
+signed_power({DATA}, 0.5)

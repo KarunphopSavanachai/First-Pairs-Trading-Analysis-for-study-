@@ -543,7 +543,7 @@ def _write_sheet(ws, rows: list, min_sharpe: float, min_fitness: float) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run(
-    template: str,
+    templates: List[str],
     credentials: Optional[str],
     universe: str,
     region: str,
@@ -559,14 +559,15 @@ def run(
     output_prefix: str,
     db_path: str,
     resume: bool,
+    data_fields_file: Optional[str] = None,
 ) -> None:
-    client = build_client(credentials)
-    engine = TemplateEngine(template)
-    db     = StateDB(db_path)
+    client  = build_client(credentials)
+    engines = [TemplateEngine(t) for t in templates]
+    db      = StateDB(db_path)
 
     try:
         _run_inner(
-            client, engine, db,
+            client, engines, db,
             universe=universe,
             region=region,
             neutralization=neutralization,
@@ -580,6 +581,7 @@ def run(
             timeout=timeout,
             output_prefix=output_prefix,
             resume=resume,
+            data_fields_file=data_fields_file,
         )
     finally:
         db.close()
@@ -587,7 +589,7 @@ def run(
 
 def _run_inner(
     client: BrainClient,
-    engine: TemplateEngine,
+    engines: List[TemplateEngine],
     db: StateDB,
     *,
     universe: str,
@@ -603,42 +605,48 @@ def _run_inner(
     timeout: int,
     output_prefix: str,
     resume: bool,
+    data_fields_file: Optional[str] = None,
 ) -> None:
     # ── Fetch & enqueue data fields ───────────────────────────────────────────
     if not resume or not db.pending():
-        log.info("Fetching data fields from BRAIN ...")
-        fields = get_data_fields(
-            client,
-            instrument_type=instrument_type,
-            region=region,
-            universe=universe,
-            delay=delay,
-            category=field_category,
-        )
+        if data_fields_file:
+            log.info("Loading data fields from %s ...", data_fields_file)
+            with open(data_fields_file) as _f:
+                fields = json.load(_f)
+            log.info("Loaded %d data fields from cache.", len(fields))
+        else:
+            log.info("Fetching data fields from BRAIN ...")
+            fields = get_data_fields(
+                client,
+                instrument_type=instrument_type,
+                region=region,
+                universe=universe,
+                delay=delay,
+                category=field_category,
+            )
         field_ids = [
             fid for f in fields
             if (fid := f.get("id") or f.get("fieldId", ""))
         ]
-        n_combos = len(field_ids) ** len(engine.placeholders)
-        if len(engine.placeholders) > 1:
-            log.info(
-                "%d fields x %d placeholders = %d combinations to enqueue.",
-                len(field_ids), len(engine.placeholders), n_combos,
-            )
-            if n_combos > 1000:
+        log.info(
+            "Enqueueing combinations for %d template(s) x %d fields ...",
+            len(engines), len(field_ids),
+        )
+        for engine in engines:
+            n_combos = len(field_ids) ** len(engine.placeholders)
+            if len(engine.placeholders) > 1 and n_combos > 1000:
                 log.warning(
-                    "%d combinations is very large. Consider using --category "
-                    "to filter data fields and keep runtime manageable.",
-                    n_combos,
+                    "Template '%s': %d combinations is very large. "
+                    "Consider using --category to filter.",
+                    engine.template[:60], n_combos,
                 )
-
-        for expr, fids in engine.all_combinations(field_ids):
-            ok, reason = engine.validate(expr)
-            if not ok:
-                log.debug("Skip %s: %s", fids, reason)
-                continue
-            db.upsert_pending(expr, "|".join(fids))
-        log.info("Enqueued %d expressions.", len(db.pending()))
+            for expr, fids in engine.all_combinations(field_ids):
+                ok, reason = engine.validate(expr)
+                if not ok:
+                    log.debug("Skip %s: %s", fids, reason)
+                    continue
+                db.upsert_pending(expr, "|".join(fids))
+        log.info("Enqueued %d expressions total.", len(db.pending()))
     else:
         log.info("Resuming -- %d pending expressions in DB.", len(db.pending()))
 
@@ -742,10 +750,25 @@ def main() -> None:
     p.add_argument(
         "--template", default=None,
         help=(
-            'Alpha expression with {DATA} placeholder. '
+            'Single alpha expression with {DATA} placeholder. '
             'Always quote it to protect curly braces from the shell. '
             'Examples:  "ts_rank({DATA},10)"  |  "rank({DATA1},10)+rank({DATA2},5)" '
-            '(required unless --test-auth is used)'
+            'Use --templates-file to run many templates at once.'
+        ),
+    )
+    p.add_argument(
+        "--templates-file", default=None,
+        help=(
+            "Path to a file with one template expression per line. "
+            "Lines starting with # are treated as comments. "
+            "Generate this file with template_generator.py."
+        ),
+    )
+    p.add_argument(
+        "--data-fields-file", default=None,
+        help=(
+            "Path to a cached JSON file of data fields produced by "
+            "brain_data_fetcher.py. Skips the API fetch when provided."
         ),
     )
     p.add_argument(
@@ -814,13 +837,24 @@ def main() -> None:
 
     args = p.parse_args()
 
-    # --template is required for normal runs but not for --test-auth
-    if not args.test_auth and not args.template:
+    # Build the templates list from --template and/or --templates-file
+    templates: List[str] = []
+    if args.templates_file:
+        with open(args.templates_file) as _f:
+            templates = [
+                ln.strip() for ln in _f
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+        log.info("Loaded %d templates from %s.", len(templates), args.templates_file)
+    if args.template:
+        templates.append(args.template)
+
+    if not args.test_auth and not templates:
         p.error(
-            "--template is required.\n"
+            "Provide at least one of --template or --templates-file.\n"
             '  Example:  --template "ts_rank({DATA}, 10)"\n'
-            "  Tip: always wrap the template in double-quotes so the shell\n"
-            "  does not interpret { } as brace expansion."
+            "  Or:       --templates-file templates.txt\n"
+            "  Tip: generate templates.txt with template_generator.py"
         )
 
     # --interactive overrides --credentials
@@ -851,7 +885,7 @@ def main() -> None:
         sys.exit(0)
 
     run(
-        template         = args.template,
+        templates        = templates,
         credentials      = credentials,
         universe         = args.universe,
         region           = args.region,
@@ -867,6 +901,7 @@ def main() -> None:
         output_prefix    = args.output,
         db_path          = args.db,
         resume           = args.resume,
+        data_fields_file = args.data_fields_file,
     )
 
 
