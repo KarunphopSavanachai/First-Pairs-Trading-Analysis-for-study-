@@ -259,6 +259,15 @@ class StateDB:
         )
         self.conn.commit()
 
+    def bulk_upsert_pending(self, rows: List[Tuple[str, str]]) -> None:
+        """Insert many (expr, field_id) pairs in a single transaction."""
+        self.conn.executemany(
+            """INSERT OR IGNORE INTO runs (expr_hash, expression, field_id, status)
+               VALUES (?, ?, ?, 'pending')""",
+            [(_sha(expr), expr, field_id) for expr, field_id in rows],
+        )
+        self.conn.commit()
+
     def mark_submitted(self, expr: str, progress_url: str) -> None:
         self.conn.execute(
             """UPDATE runs SET status='submitted', sim_id=?, submitted_at=?
@@ -632,6 +641,7 @@ def _run_inner(
             "Enqueueing combinations for %d template(s) x %d fields ...",
             len(engines), len(field_ids),
         )
+        pending_rows: List[Tuple[str, str]] = []
         for engine in engines:
             n_combos = len(field_ids) ** len(engine.placeholders)
             if len(engine.placeholders) > 1 and n_combos > 1000:
@@ -645,7 +655,9 @@ def _run_inner(
                 if not ok:
                     log.debug("Skip %s: %s", fids, reason)
                     continue
-                db.upsert_pending(expr, "|".join(fids))
+                pending_rows.append((expr, "|".join(fids)))
+        log.info("Inserting %d expressions into DB ...", len(pending_rows))
+        db.bulk_upsert_pending(pending_rows)
         log.info("Enqueued %d expressions total.", len(db.pending()))
     else:
         log.info("Resuming -- %d pending expressions in DB.", len(db.pending()))
