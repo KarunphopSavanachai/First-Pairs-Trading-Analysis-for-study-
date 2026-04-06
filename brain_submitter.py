@@ -30,7 +30,9 @@ import logging
 import re
 import sqlite3
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -383,14 +385,9 @@ class TemplateEngine:
             self.placeholders = [self._SINGLE]
             self.mode         = "single"
         else:
-            raise ValueError(
-                "Template must contain {DATA} (single) or {DATA1},{DATA2},{DATA3} (multi).\n"
-                "Examples:\n"
-                '  --template "ts_rank({DATA}, 10)"\n'
-                '  --template "rank({DATA1}, 10) + rank({DATA2}, 5)"\n'
-                "Shell tip: always wrap the template in double-quotes so your shell\n"
-                "does not strip or expand the { } characters."
-            )
+            # No placeholder — the expression is fully hardcoded; submit as-is.
+            self.placeholders = []
+            self.mode         = "static"
         self.template = template
 
     def generate(self, *field_ids: str) -> str:
@@ -401,16 +398,31 @@ class TemplateEngine:
         return expr
 
     def all_combinations(
-        self, fields: List[str]
+        self, field_lists
     ) -> List[Tuple[str, List[str]]]:
         """Return (expression, [field_ids]) for every combination.
 
-        Single mode      →  N   pairs  (one per field)
-        2 placeholders   →  N²  pairs  (cartesian product)
-        3 placeholders   →  N³  pairs
+        Parameters
+        ----------
+        field_lists : List[List[str]] or List[str]
+            Per-placeholder field ID lists.  ``field_lists[i]`` provides the
+            candidates for ``self.placeholders[i]``.  Pass a flat ``List[str]``
+            for backward compatibility — it will be used for all placeholders.
+
+        Modes
+        -----
+        static           →  1  pair  (the template verbatim, no substitution)
+        single / multi   →  cartesian product across per-placeholder lists
         """
+        if self.mode == "static":
+            return [(self.template, [])]
+
+        # Backward compat: flat list → use for every placeholder
+        if field_lists and not isinstance(field_lists[0], list):
+            field_lists = [field_lists] * len(self.placeholders)
+
         results: List[Tuple[str, List[str]]] = []
-        for combo in itertools.product(fields, repeat=len(self.placeholders)):
+        for combo in itertools.product(*field_lists):
             results.append((self.generate(*combo), list(combo)))
         return results
 
@@ -576,7 +588,78 @@ def _write_sheet(ws, rows: list, min_sharpe: float, min_fitness: float) -> None:
         ).font = Font(italic=True, color="555555", name="Arial", size=8)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 8. MAIN ORCHESTRATOR
+# 8. CATEGORY ASSIGNMENT PROMPT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def prompt_category_assignment(
+    engines: List[TemplateEngine],
+    categorized_fields: Dict[str, List[Dict]],
+) -> List[List[List[str]]]:
+    """Interactively assign a data category to each placeholder in each template.
+
+    Prints a numbered menu once per placeholder and reads stdin.  Choosing 0
+    uses all fields regardless of category.
+
+    Returns
+    -------
+    List[List[List[str]]]
+        Outer list  — one entry per engine (template).
+        Middle list — one entry per placeholder in that engine.
+        Inner list  — the field IDs for that placeholder.
+        Static templates (no placeholders) get an empty middle list [].
+    """
+    cat_names = list(categorized_fields.keys())
+    # Build field-ID list per category (skip blanks)
+    cat_ids: Dict[str, List[str]] = {
+        cat: [
+            fid for f in fields
+            if (fid := f.get("id") or f.get("fieldId", ""))
+        ]
+        for cat, fields in categorized_fields.items()
+    }
+    all_ids: List[str] = [fid for ids in cat_ids.values() for fid in ids]
+
+    result: List[List[List[str]]] = []
+    for ei, engine in enumerate(engines, 1):
+        if not engine.placeholders:
+            print(f"\nTemplate {ei}: {engine.template}")
+            print("  (no placeholder — will be submitted as-is)")
+            result.append([])
+            continue
+
+        print(f"\nTemplate {ei}: {engine.template}")
+        per_placeholder: List[List[str]] = []
+        for ph in engine.placeholders:
+            print(f"  Assign category for {ph}:")
+            print(f"    0. all fields  ({len(all_ids)} total)")
+            for ci, cat in enumerate(cat_names, 1):
+                print(f"    {ci}. {cat}  ({len(cat_ids[cat])} fields)")
+            while True:
+                try:
+                    raw = input(f"  Enter number [0-{len(cat_names)}]: ").strip()
+                    choice = int(raw)
+                    if 0 <= choice <= len(cat_names):
+                        break
+                    print(f"  Please enter a number between 0 and {len(cat_names)}.")
+                except (ValueError, EOFError):
+                    print("  Invalid input — defaulting to 0 (all fields).")
+                    choice = 0
+                    break
+
+            if choice == 0:
+                per_placeholder.append(all_ids)
+                log.info("  %s -> all fields (%d)", ph, len(all_ids))
+            else:
+                chosen = cat_names[choice - 1]
+                per_placeholder.append(cat_ids[chosen])
+                log.info("  %s -> category '%s' (%d fields)", ph, chosen, len(cat_ids[chosen]))
+
+        result.append(per_placeholder)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. MAIN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run(
@@ -649,11 +732,25 @@ def _run_inner(
         if data_fields_file:
             log.info("Loading data fields from %s ...", data_fields_file)
             with open(data_fields_file) as _f:
-                fields = json.load(_f)
-            log.info("Loaded %d data fields from cache.", len(fields))
+                raw = json.load(_f)
+            # Detect format: categorized dict vs legacy flat list
+            if isinstance(raw, dict):
+                categorized_fields = raw
+                flat_fields: List[Dict] = [
+                    f for cat_fields in raw.values() for f in cat_fields
+                ]
+                total_loaded = sum(len(v) for v in raw.values())
+                log.info(
+                    "Loaded %d fields across %d categories from cache.",
+                    total_loaded, len(raw),
+                )
+            else:
+                categorized_fields = None
+                flat_fields = raw
+                log.info("Loaded %d data fields from cache.", len(flat_fields))
         else:
             log.info("Fetching data fields from BRAIN ...")
-            fields = get_data_fields(
+            flat_fields = get_data_fields(
                 client,
                 instrument_type=instrument_type,
                 region=region,
@@ -661,29 +758,52 @@ def _run_inner(
                 delay=delay,
                 category=field_category,
             )
-        field_ids = [
-            fid for f in fields
+            categorized_fields = None
+
+        flat_field_ids: List[str] = [
+            fid for f in flat_fields
             if (fid := f.get("id") or f.get("fieldId", ""))
         ]
+
+        # Prompt user to assign categories to placeholders when categorized
+        # data is available.
+        if categorized_fields is not None:
+            field_lists_per_engine = prompt_category_assignment(
+                engines, categorized_fields
+            )
+        else:
+            # Legacy / no-category mode: use flat list for every placeholder
+            field_lists_per_engine = [
+                [flat_field_ids] * len(engine.placeholders) if engine.placeholders else []
+                for engine in engines
+            ]
+
         log.info(
             "Enqueueing combinations for %d template(s) x %d fields ...",
-            len(engines), len(field_ids),
+            len(engines), len(flat_field_ids),
         )
         pending_rows: List[Tuple[str, str]] = []
-        for engine in engines:
-            n_combos = len(field_ids) ** len(engine.placeholders)
-            if len(engine.placeholders) > 1 and n_combos > 1000:
-                log.warning(
-                    "Template '%s': %d combinations is very large. "
-                    "Consider using --category to filter.",
-                    engine.template[:60], n_combos,
-                )
-            for expr, fids in engine.all_combinations(field_ids):
+        for engine, field_lists in zip(engines, field_lists_per_engine):
+            if engine.mode == "static":
+                combos = engine.all_combinations([])
+            else:
+                # Warn when the cartesian product is very large
+                n_combos = 1
+                for fl in field_lists:
+                    n_combos *= len(fl)
+                if len(engine.placeholders) > 1 and n_combos > 1000:
+                    log.warning(
+                        "Template '%s': %d combinations is very large. "
+                        "Consider assigning a narrower category.",
+                        engine.template[:60], n_combos,
+                    )
+                combos = engine.all_combinations(field_lists)
+            for expr, fids in combos:
                 ok, reason = engine.validate(expr)
                 if not ok:
                     log.debug("Skip %s: %s", fids, reason)
                     continue
-                pending_rows.append((expr, "|".join(fids)))
+                pending_rows.append((expr, "|".join(fids) if fids else "static"))
         log.info("Inserting %d expressions into DB ...", len(pending_rows))
         db.bulk_upsert_pending(pending_rows)
         log.info("Enqueued %d expressions total.", len(db.pending()))
@@ -706,65 +826,101 @@ def _run_inner(
         "visualization":  False,
     }
 
-    # ── Submission loop ───────────────────────────────────────────────────────
+    # ── Submission loop (rolling window, max 3 parallel) ─────────────────────
     pending = db.pending()
-    log.info("Submitting %d alphas ...", len(pending))
+    total_pending = len(pending)
+    log.info("Submitting %d alphas (up to 3 in parallel) ...", total_pending)
 
-    for i, row in enumerate(pending, 1):
+    # Lock only around client.simulate() — protects against any internal
+    # BrainClient state mutation while still allowing sleeps/retries to
+    # interleave across threads.
+    _submit_lock = threading.Lock()
+
+    def _do_submit(row):
         expr = row["expression"]
         fid  = row["field_id"]
-
-        log.info("[%d/%d] Submitting: %s", i, len(pending), expr[:80])
         try:
-            sim_result = simulate_with_retry(client, expr, settings=sim_settings)
+            with _submit_lock:
+                sim_result = simulate_with_retry(client, expr, settings=sim_settings)
             db.mark_submitted(expr, sim_result.progress_url)
-        except Exception as e:
-            log.error("Submit failed for %s: %s", fid, e)
-            db.mark_failed(expr, str(e))
-            continue
+            return expr, fid, True, None
+        except Exception as exc:
+            db.mark_failed(expr, str(exc))
+            return expr, fid, False, str(exc)
 
-        time.sleep(submission_delay)  # rate-limit buffer
+    completed_submissions = 0
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_do_submit, row): row for row in pending}
+        for future in as_completed(futures):
+            completed_submissions += 1
+            expr, fid, ok, err = future.result()
+            if ok:
+                log.info(
+                    "[%d/%d] Submitted: %s",
+                    completed_submissions, total_pending, expr[:80],
+                )
+            else:
+                log.error(
+                    "[%d/%d] Failed:    %s | %s",
+                    completed_submissions, total_pending, fid, err,
+                )
+            time.sleep(submission_delay / 3)
 
-    # ── Polling loop ──────────────────────────────────────────────────────────
+    # ── Polling loop (rolling window, max 3 parallel) ────────────────────────
+    # GET requests to distinct progress URLs are safe to parallelize without
+    # a lock — each thread accesses a separate simulation result.
     submitted = db.submitted()
-    log.info("Polling %d submitted simulations ...", len(submitted))
+    log.info("Polling %d submitted simulations (up to 3 in parallel) ...", len(submitted))
 
-    for row in submitted:
-        expr         = row["expression"]
-        progress_url = row["sim_id"]  # stored as progress_url during submission
-        fid          = row["field_id"]
-
-        log.info("Polling simulation for field %s ...", fid)
+    def _do_poll(row):
+        progress_url = row["sim_id"]
         result = poll_simulation(client, progress_url, poll_interval, timeout)
+        return row["expression"], row["field_id"], result
 
-        if result is None:
-            db.mark_failed(expr, "timeout_or_error")
-            continue
-
-        metrics  = parse_metrics(result)
-        alpha_id = result.get("id") or result.get("alphaId") or ""
-        sharpe   = metrics.get("sharpe")  or 0.0
-        fitness  = metrics.get("fitness") or 0.0
-        passed   = sharpe >= min_sharpe and fitness >= min_fitness
-
-        log.info(
-            "  -> Sharpe=%.3f  Fitness=%.3f  %s",
-            sharpe, fitness, "PASS" if passed else "fail",
-        )
-        db.mark_done(expr, metrics, passed, alpha_id=alpha_id)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_do_poll, row): row for row in submitted}
+        for future in as_completed(futures):
+            expr, fid, result = future.result()
+            if result is None:
+                db.mark_failed(expr, "timeout_or_error")
+                continue
+            metrics  = parse_metrics(result)
+            alpha_id = result.get("id") or result.get("alphaId") or ""
+            sharpe   = metrics.get("sharpe")  or 0.0
+            fitness  = metrics.get("fitness") or 0.0
+            passed   = sharpe >= min_sharpe and fitness >= min_fitness
+            log.info(
+                "  -> Field=%-20s  Sharpe=%.3f  Fitness=%.3f  %s",
+                fid, sharpe, fitness, "PASS" if passed else "fail",
+            )
+            db.mark_done(expr, metrics, passed, alpha_id=alpha_id)
 
     # ── Export ────────────────────────────────────────────────────────────────
-    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    all_rows  = db.all_done()
+    ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+    all_rows   = db.all_done()
     csv_path   = f"{output_prefix}_{ts}.csv"
     excel_path = f"{output_prefix}_{ts}.xlsx"
 
     export_csv(all_rows, csv_path)
     export_excel(all_rows, excel_path, min_sharpe, min_fitness)
 
+    # Per-criterion files — one for each threshold independently
+    sharpe_rows  = [r for r in all_rows if (r["sharpe"]  or 0.0) >= min_sharpe]
+    fitness_rows = [r for r in all_rows if (r["fitness"] or 0.0) >= min_fitness]
+
+    if sharpe_rows:
+        sharpe_path = f"sharpe_passed_{ts}.xlsx"
+        export_excel(sharpe_rows, sharpe_path, min_sharpe, min_fitness)
+        log.info("Sharpe-passed  -> %s  (%d alphas)", sharpe_path, len(sharpe_rows))
+
+    if fitness_rows:
+        fitness_path = f"fitness_passed_{ts}.xlsx"
+        export_excel(fitness_rows, fitness_path, min_sharpe, min_fitness)
+        log.info("Fitness-passed -> %s  (%d alphas)", fitness_path, len(fitness_rows))
+
     passed_count = sum(1 for r in all_rows if r["passed"])
     log.info(
-        "Done. %d/%d alphas passed filters. Results: %s | %s",
+        "Done. %d/%d alphas passed all filters. Results: %s | %s",
         passed_count, len(all_rows), csv_path, excel_path,
     )
 
@@ -788,12 +944,14 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
-        "--template", default=None,
+        "--template", action="append", default=None, dest="templates_list",
         help=(
-            'Single alpha expression with {DATA} placeholder. '
-            'Always quote it to protect curly braces from the shell. '
-            'Examples:  "ts_rank({DATA},10)"  |  "rank({DATA1},10)+rank({DATA2},5)" '
-            'Use --templates-file to run many templates at once.'
+            "Alpha expression template. Can be given up to 3 times for multiple templates. "
+            "Always quote it to protect curly braces from the shell. "
+            'Examples:  --template "ts_rank({DATA},10)"  '
+            '           --template "rank({DATA1},10)+rank({DATA2},5)"  '
+            '           --template "ts_rank(close,10)" (no placeholder = submit as-is). '
+            "Use --templates-file to supply many templates from a file."
         ),
     )
     p.add_argument(
@@ -877,7 +1035,7 @@ def main() -> None:
 
     args = p.parse_args()
 
-    # Build the templates list from --template and/or --templates-file
+    # Build the templates list from --template (repeatable) and/or --templates-file
     templates: List[str] = []
     if args.templates_file:
         with open(args.templates_file) as _f:
@@ -886,8 +1044,11 @@ def main() -> None:
                 if ln.strip() and not ln.strip().startswith("#")
             ]
         log.info("Loaded %d templates from %s.", len(templates), args.templates_file)
-    if args.template:
-        templates.append(args.template)
+    templates.extend(args.templates_list or [])
+
+    if len(templates) > 3:
+        log.warning("More than 3 templates provided; only the first 3 will be used.")
+        templates = templates[:3]
 
     if not args.test_auth and not templates:
         p.error(
