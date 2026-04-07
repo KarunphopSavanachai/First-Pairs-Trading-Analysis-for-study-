@@ -27,6 +27,7 @@ import hashlib
 import itertools
 import json
 import logging
+import random
 import re
 import sqlite3
 import sys
@@ -647,12 +648,35 @@ def prompt_category_assignment(
                     break
 
             if choice == 0:
-                per_placeholder.append(all_ids)
-                log.info("  %s -> all fields (%d)", ph, len(all_ids))
+                pool = all_ids
+                log.info("  %s -> all fields (%d)", ph, len(pool))
             else:
                 chosen = cat_names[choice - 1]
-                per_placeholder.append(cat_ids[chosen])
-                log.info("  %s -> category '%s' (%d fields)", ph, chosen, len(cat_ids[chosen]))
+                pool = cat_ids[chosen]
+                log.info("  %s -> category '%s' (%d fields)", ph, chosen, len(pool))
+
+            # Ask how many fields to randomly sample from this pool.
+            # 0 = use all (run as normal).
+            print(f"  How many fields to randomly sample from this pool of {len(pool)}?")
+            print(f"  (Enter 0 to use all {len(pool)} fields)")
+            while True:
+                try:
+                    sample_n = int(input("  Sample size [0 = all]: ").strip())
+                    if 0 <= sample_n <= len(pool):
+                        break
+                    print(f"  Please enter a number between 0 and {len(pool)}.")
+                except (ValueError, EOFError):
+                    print("  Invalid input — defaulting to 0 (use all).")
+                    sample_n = 0
+                    break
+
+            if sample_n == 0:
+                per_placeholder.append(pool)
+                log.info("    -> using all %d fields", len(pool))
+            else:
+                sampled = random.sample(pool, sample_n)
+                per_placeholder.append(sampled)
+                log.info("    -> randomly sampled %d / %d fields", sample_n, len(pool))
 
         result.append(per_placeholder)
     return result
