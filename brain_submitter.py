@@ -299,6 +299,11 @@ class StateDB:
         )
         self.conn.commit()
 
+    def clear(self) -> None:
+        """Delete all rows — wipes stale state before a fresh (non-resume) run."""
+        self.conn.execute("DELETE FROM runs")
+        self.conn.commit()
+
     def mark_submitted(self, expr: str, progress_url: str) -> None:
         self.conn.execute(
             """UPDATE runs SET status='submitted', sim_id=?, submitted_at=?
@@ -753,6 +758,15 @@ def _run_inner(
 ) -> None:
     # ── Fetch & enqueue data fields ───────────────────────────────────────────
     if not resume or not db.pending():
+        if not resume:
+            existing = len(db.pending())
+            if existing:
+                log.info(
+                    "Clearing %d stale row(s) from a previous run "
+                    "(pass --resume to continue that run instead).",
+                    existing,
+                )
+                db.clear()
         if data_fields_file:
             log.info("Loading data fields from %s ...", data_fields_file)
             with open(data_fields_file) as _f:
