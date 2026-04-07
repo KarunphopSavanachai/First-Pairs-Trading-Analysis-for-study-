@@ -516,24 +516,34 @@ def export_csv(rows: list, path: str) -> None:
 
 
 def export_excel(
-    rows: list, path: str, min_sharpe: float, min_fitness: float
+    rows: list,
+    path: str,
+    min_sharpe: float,
+    min_fitness: float,
+    min_sharpe_low: Optional[float] = None,
 ) -> None:
     wb = Workbook()
 
     # Sheet 1: Passed alphas
     ws = wb.active
     ws.title = "Passed Alphas"
-    _write_sheet(ws, [r for r in rows if r["passed"]], min_sharpe, min_fitness)
+    _write_sheet(
+        ws, [r for r in rows if r["passed"]],
+        min_sharpe, min_fitness, min_sharpe_low,
+    )
 
     # Sheet 2: All results
     ws2 = wb.create_sheet("All Results")
-    _write_sheet(ws2, rows, min_sharpe, min_fitness)
+    _write_sheet(ws2, rows, min_sharpe, min_fitness, min_sharpe_low)
 
     wb.save(path)
     log.info("Excel saved -> %s", path)
 
 
-def _write_sheet(ws, rows: list, min_sharpe: float, min_fitness: float) -> None:
+def _write_sheet(
+    ws, rows: list, min_sharpe: float, min_fitness: float,
+    min_sharpe_low: Optional[float] = None,
+) -> None:
     HEADERS = [
         "Expression", "Field ID", "Sharpe", "Fitness",
         "Turnover", "Ann. Return", "Max Drawdown",
@@ -566,9 +576,11 @@ def _write_sheet(ws, rows: list, min_sharpe: float, min_fitness: float) -> None:
         fitness = row["fitness"] or 0.0
         passed  = bool(row["passed"])
 
+        near_upper = sharpe >= min_sharpe * 0.8
+        near_lower = min_sharpe_low is not None and sharpe <= min_sharpe_low * 0.8
         if passed:
             row_fill = green_fill
-        elif sharpe >= min_sharpe * 0.8 and fitness >= min_fitness * 0.8:
+        elif (near_upper or near_lower) and fitness >= min_fitness * 0.8:
             row_fill = yellow_fill
         else:
             row_fill = red_fill
@@ -607,10 +619,13 @@ def _write_sheet(ws, rows: list, min_sharpe: float, min_fitness: float) -> None:
         ws.cell(row=sr, column=3, value=f"=MAX(C2:C{last_data_row})")
         ws.cell(row=sr, column=4, value=f"=MAX(D2:D{last_data_row})")
 
+        sharpe_desc = f">= {min_sharpe}"
+        if min_sharpe_low is not None:
+            sharpe_desc += f" or <= {min_sharpe_low}"
         ws.cell(
             row=ws.max_row + 2, column=1,
             value=(
-                f"Filters applied:  min Sharpe >= {min_sharpe}"
+                f"Filters applied:  Sharpe {sharpe_desc}"
                 f"  |  min Fitness >= {min_fitness}"
             ),
         ).font = Font(italic=True, color="555555", name="Arial", size=8)
@@ -721,13 +736,17 @@ def _record_result(
     min_sharpe: float,
     min_fitness: float,
     label: str,
+    min_sharpe_low: Optional[float] = None,
 ) -> None:
     """Parse a completed simulation result and persist it to the DB."""
     metrics  = parse_metrics(result)
     alpha_id = result.get("id") or result.get("alphaId") or ""
     sharpe   = metrics.get("sharpe")  or 0.0
     fitness  = metrics.get("fitness") or 0.0
-    passed   = sharpe >= min_sharpe and fitness >= min_fitness
+    sharpe_ok = sharpe >= min_sharpe or (
+        min_sharpe_low is not None and sharpe <= min_sharpe_low
+    )
+    passed = sharpe_ok and fitness >= min_fitness
     log.info(
         "%s  Field=%-20s  Sharpe=%.3f  Fitness=%.3f  %s",
         label, fid, sharpe, fitness, "PASS" if passed else "fail",
@@ -747,6 +766,7 @@ def _run_template_lane(
     timeout: int,
     min_sharpe: float,
     min_fitness: float,
+    min_sharpe_low: Optional[float] = None,
 ) -> None:
     """Run all simulations for one template sequentially.
 
@@ -766,7 +786,7 @@ def _run_template_lane(
         if result is None:
             db.mark_failed(expr, "timeout_or_error")
             continue
-        _record_result(db, expr, fid, result, min_sharpe, min_fitness, label)
+        _record_result(db, expr, fid, result, min_sharpe, min_fitness, label, min_sharpe_low)
 
     # Submit + poll pending rows one at a time
     rows  = db.pending_for_template(template_idx)
@@ -794,7 +814,7 @@ def _run_template_lane(
         if result is None:
             db.mark_failed(expr, "timeout_or_error")
             continue
-        _record_result(db, expr, fid, result, min_sharpe, min_fitness, label)
+        _record_result(db, expr, fid, result, min_sharpe, min_fitness, label, min_sharpe_low)
 
     log.info("%s  done.", label)
 
@@ -821,6 +841,7 @@ def run(
     db_path: str,
     resume: bool,
     data_fields_file: Optional[str] = None,
+    min_sharpe_low: Optional[float] = None,
 ) -> None:
     client  = build_client(credentials)
     engines = [TemplateEngine(t) for t in templates]
@@ -836,6 +857,7 @@ def run(
             delay=delay,
             min_sharpe=min_sharpe,
             min_fitness=min_fitness,
+            min_sharpe_low=min_sharpe_low,
             field_category=field_category,
             submission_delay=submission_delay,
             poll_interval=poll_interval,
@@ -867,6 +889,7 @@ def _run_inner(
     output_prefix: str,
     resume: bool,
     data_fields_file: Optional[str] = None,
+    min_sharpe_low: Optional[float] = None,
 ) -> None:
     # ── Fetch & enqueue data fields ───────────────────────────────────────────
     if not resume or not db.pending():
@@ -993,7 +1016,7 @@ def _run_inner(
                 _run_template_lane,
                 tidx, engine, db, client, sim_settings,
                 submit_lock, submission_delay, poll_interval, timeout,
-                min_sharpe, min_fitness,
+                min_sharpe, min_fitness, min_sharpe_low,
             ): tidx
             for tidx, engine in enumerate(engines)
         }
@@ -1011,20 +1034,24 @@ def _run_inner(
     excel_path = f"{output_prefix}_{ts}.xlsx"
 
     export_csv(all_rows, csv_path)
-    export_excel(all_rows, excel_path, min_sharpe, min_fitness)
+    export_excel(all_rows, excel_path, min_sharpe, min_fitness, min_sharpe_low)
 
     # Per-criterion files — one for each threshold independently
-    sharpe_rows  = [r for r in all_rows if (r["sharpe"]  or 0.0) >= min_sharpe]
+    def _sharpe_ok(s):
+        v = s or 0.0
+        return v >= min_sharpe or (min_sharpe_low is not None and v <= min_sharpe_low)
+
+    sharpe_rows  = [r for r in all_rows if _sharpe_ok(r["sharpe"])]
     fitness_rows = [r for r in all_rows if (r["fitness"] or 0.0) >= min_fitness]
 
     if sharpe_rows:
         sharpe_path = f"sharpe_passed_{ts}.xlsx"
-        export_excel(sharpe_rows, sharpe_path, min_sharpe, min_fitness)
+        export_excel(sharpe_rows, sharpe_path, min_sharpe, min_fitness, min_sharpe_low)
         log.info("Sharpe-passed  -> %s  (%d alphas)", sharpe_path, len(sharpe_rows))
 
     if fitness_rows:
         fitness_path = f"fitness_passed_{ts}.xlsx"
-        export_excel(fitness_rows, fitness_path, min_sharpe, min_fitness)
+        export_excel(fitness_rows, fitness_path, min_sharpe, min_fitness, min_sharpe_low)
         log.info("Fitness-passed -> %s  (%d alphas)", fitness_path, len(fitness_rows))
 
     passed_count = sum(1 for r in all_rows if r["passed"])
@@ -1103,7 +1130,15 @@ def main() -> None:
     p.add_argument("--delay",            default=1, type=int)
     p.add_argument(
         "--sharpe", default=1.25, type=float,
-        help="Minimum Sharpe ratio to pass",
+        help="Upper Sharpe threshold — alpha passes if sharpe >= this value",
+    )
+    p.add_argument(
+        "--sharpe-low", default=None, type=float,
+        help=(
+            "Optional lower (negative) Sharpe threshold.  When set, an alpha "
+            "also passes the Sharpe test if sharpe <= this value.  "
+            "Example: --sharpe 0.8 --sharpe-low -0.8"
+        ),
     )
     p.add_argument(
         "--fitness", default=1.0, type=float,
@@ -1203,6 +1238,7 @@ def main() -> None:
         instrument_type  = args.instrument_type,
         delay            = args.delay,
         min_sharpe       = args.sharpe,
+        min_sharpe_low   = args.sharpe_low,
         min_fitness      = args.fitness,
         field_category   = args.category,
         submission_delay = args.submission_delay,
