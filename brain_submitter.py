@@ -248,6 +248,7 @@ class StateDB:
         expression   TEXT NOT NULL,
         field_id     TEXT NOT NULL,
         status       TEXT NOT NULL DEFAULT 'pending',
+        template_idx INTEGER NOT NULL DEFAULT 0,
         sim_id       TEXT,
         alpha_id     TEXT,
         sharpe       REAL,
@@ -269,6 +270,14 @@ class StateDB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(self.DDL)
         self.conn.commit()
+        # Migrate existing DBs that predate the template_idx column
+        try:
+            self.conn.execute(
+                "ALTER TABLE runs ADD COLUMN template_idx INTEGER NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     def close(self) -> None:
         """Explicitly close the database connection."""
@@ -290,12 +299,13 @@ class StateDB:
         )
         self.conn.commit()
 
-    def bulk_upsert_pending(self, rows: List[Tuple[str, str]]) -> None:
-        """Insert many (expr, field_id) pairs in a single transaction."""
+    def bulk_upsert_pending(self, rows: List[Tuple[str, str, int]]) -> None:
+        """Insert many (expr, field_id, template_idx) triples in one transaction."""
         self.conn.executemany(
-            """INSERT OR IGNORE INTO runs (expr_hash, expression, field_id, status)
-               VALUES (?, ?, ?, 'pending')""",
-            [(_sha(expr), expr, field_id) for expr, field_id in rows],
+            """INSERT OR IGNORE INTO runs
+                   (expr_hash, expression, field_id, status, template_idx)
+               VALUES (?, ?, ?, 'pending', ?)""",
+            [(_sha(expr), expr, field_id, tidx) for expr, field_id, tidx in rows],
         )
         self.conn.commit()
 
@@ -361,6 +371,18 @@ class StateDB:
     def all_done(self) -> List[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM runs WHERE status='done' ORDER BY sharpe DESC"
+        ).fetchall()
+
+    def pending_for_template(self, template_idx: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM runs WHERE status='pending' AND template_idx=? ORDER BY rowid",
+            (template_idx,),
+        ).fetchall()
+
+    def submitted_for_template(self, template_idx: int) -> List[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM runs WHERE status='submitted' AND template_idx=? ORDER BY rowid",
+            (template_idx,),
         ).fetchall()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -688,7 +710,97 @@ def prompt_category_assignment(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 9. MAIN ORCHESTRATOR
+# 9. PER-TEMPLATE LANE RUNNER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _record_result(
+    db: StateDB,
+    expr: str,
+    fid: str,
+    result: Dict,
+    min_sharpe: float,
+    min_fitness: float,
+    label: str,
+) -> None:
+    """Parse a completed simulation result and persist it to the DB."""
+    metrics  = parse_metrics(result)
+    alpha_id = result.get("id") or result.get("alphaId") or ""
+    sharpe   = metrics.get("sharpe")  or 0.0
+    fitness  = metrics.get("fitness") or 0.0
+    passed   = sharpe >= min_sharpe and fitness >= min_fitness
+    log.info(
+        "%s  Field=%-20s  Sharpe=%.3f  Fitness=%.3f  %s",
+        label, fid, sharpe, fitness, "PASS" if passed else "fail",
+    )
+    db.mark_done(expr, metrics, passed, alpha_id=alpha_id)
+
+
+def _run_template_lane(
+    template_idx: int,
+    engine: "TemplateEngine",
+    db: StateDB,
+    client,
+    sim_settings: Dict,
+    submit_lock: threading.Lock,
+    submission_delay: float,
+    poll_interval: int,
+    timeout: int,
+    min_sharpe: float,
+    min_fitness: float,
+) -> None:
+    """Run all simulations for one template sequentially.
+
+    On resume, any already-submitted rows are polled first, then remaining
+    pending rows are submitted and polled one by one.  The submit_lock is
+    held only during the brief client.simulate() call so other lanes can
+    interleave their submits while this lane is waiting for poll results.
+    """
+    label = f"Lane {template_idx + 1} [{engine.template[:35]}]"
+
+    # Resume: poll any rows that were submitted but not yet polled
+    for row in db.submitted_for_template(template_idx):
+        expr   = row["expression"]
+        fid    = row["field_id"]
+        log.info("%s  Resuming poll for: %s", label, expr[:70])
+        result = poll_simulation(client, row["sim_id"], poll_interval, timeout)
+        if result is None:
+            db.mark_failed(expr, "timeout_or_error")
+            continue
+        _record_result(db, expr, fid, result, min_sharpe, min_fitness, label)
+
+    # Submit + poll pending rows one at a time
+    rows  = db.pending_for_template(template_idx)
+    total = len(rows)
+    log.info("%s  %d expression(s) to simulate.", label, total)
+    for i, row in enumerate(rows, 1):
+        expr = row["expression"]
+        fid  = row["field_id"]
+        log.info("%s  [%d/%d] Submitting: %s", label, i, total, expr[:70])
+        try:
+            with submit_lock:
+                sim_result = simulate_with_retry(
+                    client, expr, settings=sim_settings
+                )
+            db.mark_submitted(expr, sim_result.progress_url)
+        except Exception as exc:
+            log.error("%s  Submit failed: %s", label, exc)
+            db.mark_failed(expr, str(exc))
+            continue
+
+        time.sleep(submission_delay)
+        result = poll_simulation(
+            client, sim_result.progress_url, poll_interval, timeout
+        )
+        if result is None:
+            db.mark_failed(expr, "timeout_or_error")
+            continue
+        _record_result(db, expr, fid, result, min_sharpe, min_fitness, label)
+
+    log.info("%s  done.", label)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. MAIN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run(
@@ -820,8 +932,10 @@ def _run_inner(
             "Enqueueing combinations for %d template(s) x %d fields ...",
             len(engines), len(flat_field_ids),
         )
-        pending_rows: List[Tuple[str, str]] = []
-        for engine, field_lists in zip(engines, field_lists_per_engine):
+        pending_rows: List[Tuple[str, str, int]] = []
+        for tidx, (engine, field_lists) in enumerate(
+            zip(engines, field_lists_per_engine)
+        ):
             if engine.mode == "static":
                 combos = engine.all_combinations([])
             else:
@@ -841,7 +955,9 @@ def _run_inner(
                 if not ok:
                     log.debug("Skip %s: %s", fids, reason)
                     continue
-                pending_rows.append((expr, "|".join(fids) if fids else "static"))
+                pending_rows.append(
+                    (expr, "|".join(fids) if fids else "static", tidx)
+                )
         log.info("Inserting %d expressions into DB ...", len(pending_rows))
         db.bulk_upsert_pending(pending_rows)
         log.info("Enqueued %d expressions total.", len(db.pending()))
@@ -864,74 +980,29 @@ def _run_inner(
         "visualization":  False,
     }
 
-    # ── Submission loop (rolling window, max 3 parallel) ─────────────────────
-    pending = db.pending()
-    total_pending = len(pending)
-    log.info("Submitting %d alphas (up to 3 in parallel) ...", total_pending)
-
-    # Lock only around client.simulate() — protects against any internal
-    # BrainClient state mutation while still allowing sleeps/retries to
-    # interleave across threads.
-    _submit_lock = threading.Lock()
-
-    def _do_submit(row):
-        expr = row["expression"]
-        fid  = row["field_id"]
-        try:
-            with _submit_lock:
-                sim_result = simulate_with_retry(client, expr, settings=sim_settings)
-            db.mark_submitted(expr, sim_result.progress_url)
-            return expr, fid, True, None
-        except Exception as exc:
-            db.mark_failed(expr, str(exc))
-            return expr, fid, False, str(exc)
-
-    completed_submissions = 0
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(_do_submit, row): row for row in pending}
+    # ── Per-template parallel lanes ───────────────────────────────────────────
+    # Each template gets its own dedicated lane (thread).  Within a lane,
+    # submit and poll are sequential so exactly one simulation per template
+    # is in-flight at any time.  Lanes run in parallel across templates.
+    # The submit_lock serialises the brief client.simulate() call across lanes.
+    submit_lock = threading.Lock()
+    log.info("Running %d template lane(s) in parallel ...", len(engines))
+    with ThreadPoolExecutor(max_workers=len(engines)) as executor:
+        futures = {
+            executor.submit(
+                _run_template_lane,
+                tidx, engine, db, client, sim_settings,
+                submit_lock, submission_delay, poll_interval, timeout,
+                min_sharpe, min_fitness,
+            ): tidx
+            for tidx, engine in enumerate(engines)
+        }
         for future in as_completed(futures):
-            completed_submissions += 1
-            expr, fid, ok, err = future.result()
-            if ok:
-                log.info(
-                    "[%d/%d] Submitted: %s",
-                    completed_submissions, total_pending, expr[:80],
-                )
-            else:
-                log.error(
-                    "[%d/%d] Failed:    %s | %s",
-                    completed_submissions, total_pending, fid, err,
-                )
-            time.sleep(submission_delay / 3)
-
-    # ── Polling loop (rolling window, max 3 parallel) ────────────────────────
-    # GET requests to distinct progress URLs are safe to parallelize without
-    # a lock — each thread accesses a separate simulation result.
-    submitted = db.submitted()
-    log.info("Polling %d submitted simulations (up to 3 in parallel) ...", len(submitted))
-
-    def _do_poll(row):
-        progress_url = row["sim_id"]
-        result = poll_simulation(client, progress_url, poll_interval, timeout)
-        return row["expression"], row["field_id"], result
-
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(_do_poll, row): row for row in submitted}
-        for future in as_completed(futures):
-            expr, fid, result = future.result()
-            if result is None:
-                db.mark_failed(expr, "timeout_or_error")
-                continue
-            metrics  = parse_metrics(result)
-            alpha_id = result.get("id") or result.get("alphaId") or ""
-            sharpe   = metrics.get("sharpe")  or 0.0
-            fitness  = metrics.get("fitness") or 0.0
-            passed   = sharpe >= min_sharpe and fitness >= min_fitness
-            log.info(
-                "  -> Field=%-20s  Sharpe=%.3f  Fitness=%.3f  %s",
-                fid, sharpe, fitness, "PASS" if passed else "fail",
-            )
-            db.mark_done(expr, metrics, passed, alpha_id=alpha_id)
+            tidx = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                log.error("Lane %d raised an unhandled exception: %s", tidx + 1, exc)
 
     # ── Export ────────────────────────────────────────────────────────────────
     ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
