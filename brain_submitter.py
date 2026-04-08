@@ -728,6 +728,31 @@ def prompt_category_assignment(
 # 9. PER-TEMPLATE LANE RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def fetch_alpha_details(client, alpha_id: str) -> Optional[Dict]:
+    """GET /alphas/{alpha_id} and return the full alpha record, or None on error.
+
+    The progress-URL response only contains status + id; the IS stats (sharpe,
+    fitness, turnover, etc.) are only available at this separate endpoint.
+    """
+    url = f"{BRAIN_BASE}/alphas/{alpha_id}"
+    for _attempt in range(3):
+        try:
+            r = _get_session(client).get(url)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 60))
+                log.warning(
+                    "Rate limited fetching alpha details. Waiting %ds ...", wait
+                )
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            log.warning("Could not fetch alpha details for %s: %s", alpha_id, exc)
+            return None
+    return None
+
+
 def _record_result(
     db: StateDB,
     expr: str,
@@ -737,10 +762,19 @@ def _record_result(
     min_fitness: float,
     label: str,
     min_sharpe_low: Optional[float] = None,
+    client=None,
 ) -> None:
     """Parse a completed simulation result and persist it to the DB."""
     metrics  = parse_metrics(result)
     alpha_id = result.get("id") or result.get("alphaId") or ""
+
+    # The progress-URL response often omits IS stats; fetch the full alpha record
+    # from /alphas/{id} whenever all metrics come back as None.
+    if client and alpha_id and all(v is None for v in metrics.values()):
+        log.debug("Fetching IS stats from /alphas/%s ...", alpha_id)
+        full = fetch_alpha_details(client, alpha_id)
+        if full:
+            metrics = parse_metrics(full)
     sharpe   = metrics.get("sharpe")  or 0.0
     fitness  = metrics.get("fitness") or 0.0
     sharpe_ok = sharpe >= min_sharpe or (
@@ -786,7 +820,10 @@ def _run_template_lane(
         if result is None:
             db.mark_failed(expr, "timeout_or_error")
             continue
-        _record_result(db, expr, fid, result, min_sharpe, min_fitness, label, min_sharpe_low)
+        _record_result(
+            db, expr, fid, result, min_sharpe, min_fitness, label,
+            min_sharpe_low, client=client,
+        )
 
     # Submit + poll pending rows one at a time
     rows  = db.pending_for_template(template_idx)
@@ -814,7 +851,10 @@ def _run_template_lane(
         if result is None:
             db.mark_failed(expr, "timeout_or_error")
             continue
-        _record_result(db, expr, fid, result, min_sharpe, min_fitness, label, min_sharpe_low)
+        _record_result(
+            db, expr, fid, result, min_sharpe, min_fitness, label,
+            min_sharpe_low, client=client,
+        )
 
     log.info("%s  done.", label)
 
