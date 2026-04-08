@@ -695,10 +695,23 @@ def _record_result(
     client=None,
 ) -> None:
     """Parse a completed simulation result and persist it to the DB."""
-    alpha_id = result.get("id") or result.get("alphaId") or ""
+    # The progress-URL response contains the SIMULATION id under "id" and the
+    # actual ALPHA id under "alpha" (sometimes a string, sometimes a dict
+    # like {"id": "..."}).  Older API versions may use "alphaId".  We must
+    # use the alpha id (NOT the simulation id) for /alphas/{...}.
+    alpha_field = result.get("alpha")
+    if isinstance(alpha_field, dict):
+        alpha_id = alpha_field.get("id", "")
+    else:
+        alpha_id = alpha_field or result.get("alphaId") or ""
+    if not alpha_id:
+        log.warning(
+            "%s  No alpha id in sim result.  Result keys: %s",
+            label, list(result.keys()),
+        )
 
-    # Always fetch the full alpha record from /alphas/{id} — the progress-URL
-    # response only contains {"status": "COMPLETE", "id": "..."} with no stats.
+    # Always fetch the full alpha record from /alphas/{alpha_id} — the
+    # progress-URL response only contains status + id and never has IS stats.
     metrics = None
     if client and alpha_id:
         log.info("Fetching IS stats from /alphas/%s ...", alpha_id)
