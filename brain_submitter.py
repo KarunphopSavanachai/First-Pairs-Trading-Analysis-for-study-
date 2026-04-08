@@ -731,13 +731,25 @@ def _record_result(
 
     sharpe  = metrics.get("sharpe")  if metrics.get("sharpe")  is not None else 0.0
     fitness = metrics.get("fitness") if metrics.get("fitness") is not None else 0.0
-    sharpe_ok = sharpe >= min_sharpe or (
+    sharpe_ok  = sharpe >= min_sharpe or (
         min_sharpe_low is not None and sharpe <= min_sharpe_low
     )
-    passed = sharpe_ok and fitness >= min_fitness
+    fitness_ok = fitness >= min_fitness
+    passed     = sharpe_ok or fitness_ok  # OR: either threshold alone is enough
+
+    if passed:
+        parts = []
+        if sharpe_ok:
+            parts.append("sharpe")
+        if fitness_ok:
+            parts.append("fitness")
+        reason = "PASS(" + "+".join(parts) + ")"
+    else:
+        reason = "fail"
+
     log.info(
-        "%s  Field=%-20s  Sharpe=%.3f  Fitness=%.3f  %s",
-        label, fid, sharpe, fitness, "PASS" if passed else "fail",
+        "%s  Field=%-20s  Sharpe=%.3f(thr %.2f)  Fitness=%.3f(thr %.2f)  %s",
+        label, fid, sharpe, min_sharpe, fitness, min_fitness, reason,
     )
     db.mark_done(expr, metrics, passed, alpha_id=alpha_id)
 
