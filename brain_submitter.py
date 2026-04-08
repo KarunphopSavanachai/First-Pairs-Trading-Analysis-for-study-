@@ -701,6 +701,7 @@ def run(
     db_path: str,
     resume: bool,
     min_sharpe_low: Optional[float] = None,
+    data_fields_file: Optional[str] = None,
 ) -> None:
     client  = build_client(credentials)
     engines = [TemplateEngine(t) for t in templates]
@@ -722,6 +723,7 @@ def run(
             timeout=timeout,
             output_prefix=output_prefix,
             resume=resume,
+            data_fields_file=data_fields_file,
         )
     finally:
         db.close()
@@ -745,6 +747,7 @@ def _run_inner(
     output_prefix: str,
     resume: bool,
     min_sharpe_low: Optional[float] = None,
+    data_fields_file: Optional[str] = None,
 ) -> None:
     # ── Enqueue templates ─────────────────────────────────────────────────────
     if not resume or not db.pending():
@@ -758,6 +761,22 @@ def _run_inner(
                 )
                 db.clear()
 
+        # Load field IDs from file (flat — no category prompt)
+        flat_field_ids: List[str] = []
+        if data_fields_file:
+            log.info("Loading data fields from %s ...", data_fields_file)
+            with open(data_fields_file) as _f:
+                raw = json.load(_f)
+            if isinstance(raw, dict):          # categorised dict → flatten
+                flat = [f for cat in raw.values() for f in cat]
+            else:
+                flat = raw
+            flat_field_ids = [
+                fid for f in flat
+                if (fid := f.get("id") or f.get("fieldId", ""))
+            ]
+            log.info("Loaded %d field ID(s).", len(flat_field_ids))
+
         pending_rows: List[Tuple[str, str, int]] = []
         for tidx, engine in enumerate(engines):
             if engine.mode == "static":
@@ -770,11 +789,22 @@ def _run_inner(
                         "Template %d skipped (%s): %s", tidx + 1, expr[:60], reason
                     )
             else:
-                log.warning(
-                    "Template %d has placeholder(s) %s — write the full "
-                    "expression without {DATA} placeholders. Skipping.",
-                    tidx + 1, engine.placeholders,
-                )
+                if not flat_field_ids:
+                    log.warning(
+                        "Template %d has placeholder(s) %s but no --data-fields-file "
+                        "was provided. Skipping.",
+                        tidx + 1, engine.placeholders,
+                    )
+                    continue
+                combos = engine.all_combinations(flat_field_ids)
+                for expr, fids in combos:
+                    ok, reason = engine.validate(expr)
+                    if not ok:
+                        log.debug("Skip %s: %s", fids, reason)
+                        continue
+                    pending_rows.append(
+                        (expr, "|".join(fids) if fids else "static", tidx)
+                    )
 
         db.bulk_upsert_pending(pending_rows)
         log.info("Enqueued %d expression(s).", len(pending_rows))
@@ -872,6 +902,15 @@ def main() -> None:
             "Path to a file with one template expression per line. "
             "Lines starting with # are treated as comments. "
             "Generate this file with template_generator.py."
+        ),
+    )
+    p.add_argument(
+        "--data-fields-file", default=None,
+        help=(
+            "Path to a JSON file of data fields (produced by brain_data_fetcher.py). "
+            "Required when templates contain {DATA} / {DATA1} placeholders. "
+            "Accepts a flat list [{...}, ...] or a categorised dict "
+            "{'fundamental': [...], ...}."
         ),
     )
     p.add_argument(
@@ -1015,6 +1054,7 @@ def main() -> None:
         output_prefix    = args.output,
         db_path          = args.db,
         resume           = args.resume,
+        data_fields_file = args.data_fields_file,
     )
 
 
