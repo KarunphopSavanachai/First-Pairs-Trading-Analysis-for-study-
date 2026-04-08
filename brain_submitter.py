@@ -27,6 +27,7 @@ import hashlib
 import itertools
 import json
 import logging
+import random
 import re
 import sqlite3
 import sys
@@ -470,7 +471,96 @@ def export_csv(rows: list, path: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 8. PER-TEMPLATE LANE RUNNER
+# 8. CATEGORY ASSIGNMENT PROMPT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def prompt_category_assignment(
+    engines: List["TemplateEngine"],
+    categorized_fields: Dict[str, List[Dict]],
+) -> List[List[List[str]]]:
+    """Interactively assign a data category + sample size to each placeholder.
+
+    Returns
+    -------
+    List[List[List[str]]]
+        Outer list  — one entry per engine (template).
+        Middle list — one entry per placeholder in that engine.
+        Inner list  — the chosen (and possibly sampled) field IDs.
+        Static templates get an empty middle list [].
+    """
+    cat_names = list(categorized_fields.keys())
+    cat_ids: Dict[str, List[str]] = {
+        cat: [
+            fid for f in fields
+            if (fid := f.get("id") or f.get("fieldId", ""))
+        ]
+        for cat, fields in categorized_fields.items()
+    }
+    all_ids: List[str] = [fid for ids in cat_ids.values() for fid in ids]
+
+    result: List[List[List[str]]] = []
+    for ei, engine in enumerate(engines, 1):
+        if not engine.placeholders:
+            print(f"\nTemplate {ei}: {engine.template}")
+            print("  (no placeholder — will be submitted as-is)")
+            result.append([])
+            continue
+
+        print(f"\nTemplate {ei}: {engine.template}")
+        per_placeholder: List[List[str]] = []
+        for ph in engine.placeholders:
+            # ── Category selection ───────────────────────────────────────────
+            print(f"  Assign category for {ph}:")
+            print(f"    0. all fields  ({len(all_ids)} total)")
+            for ci, cat in enumerate(cat_names, 1):
+                print(f"    {ci}. {cat}  ({len(cat_ids[cat])} fields)")
+            while True:
+                try:
+                    choice = int(input(f"  Enter number [0-{len(cat_names)}]: ").strip())
+                    if 0 <= choice <= len(cat_names):
+                        break
+                    print(f"  Please enter a number between 0 and {len(cat_names)}.")
+                except (ValueError, EOFError):
+                    print("  Invalid input — defaulting to 0 (all fields).")
+                    choice = 0
+                    break
+
+            if choice == 0:
+                pool = all_ids
+                log.info("  %s -> all fields (%d)", ph, len(pool))
+            else:
+                chosen_cat = cat_names[choice - 1]
+                pool = cat_ids[chosen_cat]
+                log.info("  %s -> category '%s' (%d fields)", ph, chosen_cat, len(pool))
+
+            # ── Sample-size selection ────────────────────────────────────────
+            print(f"  How many fields to randomly sample from this pool of {len(pool)}?")
+            print(f"  (Enter 0 to use all {len(pool)} fields)")
+            while True:
+                try:
+                    sample_n = int(input("  Sample size [0 = all]: ").strip())
+                    if 0 <= sample_n <= len(pool):
+                        break
+                    print(f"  Please enter a number between 0 and {len(pool)}.")
+                except (ValueError, EOFError):
+                    print("  Invalid input — defaulting to 0 (use all).")
+                    sample_n = 0
+                    break
+
+            if sample_n == 0:
+                per_placeholder.append(pool)
+                log.info("    -> using all %d fields", len(pool))
+            else:
+                sampled = random.sample(pool, sample_n)
+                per_placeholder.append(sampled)
+                log.info("    -> randomly sampled %d / %d fields", sample_n, len(pool))
+
+        result.append(per_placeholder)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. PER-TEMPLATE LANE RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_alpha_details(client, alpha_id: str) -> Optional[Dict]:
@@ -761,13 +851,15 @@ def _run_inner(
                 )
                 db.clear()
 
-        # Load field IDs from file (flat — no category prompt)
+        # Load data fields — prompt for category+sample when categorised
+        categorized_fields: Optional[Dict[str, List[Dict]]] = None
         flat_field_ids: List[str] = []
         if data_fields_file:
             log.info("Loading data fields from %s ...", data_fields_file)
             with open(data_fields_file) as _f:
                 raw = json.load(_f)
-            if isinstance(raw, dict):          # categorised dict → flatten
+            if isinstance(raw, dict):
+                categorized_fields = raw
                 flat = [f for cat in raw.values() for f in cat]
             else:
                 flat = raw
@@ -775,10 +867,23 @@ def _run_inner(
                 fid for f in flat
                 if (fid := f.get("id") or f.get("fieldId", ""))
             ]
-            log.info("Loaded %d field ID(s).", len(flat_field_ids))
+            log.info(
+                "Loaded %d field ID(s) across %s.", len(flat_field_ids),
+                f"{len(raw)} categories" if isinstance(raw, dict) else "1 flat list",
+            )
+
+        # Categorised JSON → interactive prompt per placeholder
+        # Flat JSON        → use all fields for every placeholder (no prompt)
+        if categorized_fields is not None:
+            field_lists_per_engine = prompt_category_assignment(engines, categorized_fields)
+        else:
+            field_lists_per_engine = [
+                [flat_field_ids] * len(engine.placeholders) if engine.placeholders else []
+                for engine in engines
+            ]
 
         pending_rows: List[Tuple[str, str, int]] = []
-        for tidx, engine in enumerate(engines):
+        for tidx, (engine, field_lists) in enumerate(zip(engines, field_lists_per_engine)):
             if engine.mode == "static":
                 expr = engine.template
                 ok, reason = engine.validate(expr)
@@ -789,14 +894,13 @@ def _run_inner(
                         "Template %d skipped (%s): %s", tidx + 1, expr[:60], reason
                     )
             else:
-                if not flat_field_ids:
+                if not field_lists or not any(field_lists):
                     log.warning(
-                        "Template %d has placeholder(s) %s but no --data-fields-file "
-                        "was provided. Skipping.",
-                        tidx + 1, engine.placeholders,
+                        "Template %d has placeholder(s) %s but no fields were selected. "
+                        "Skipping.", tidx + 1, engine.placeholders,
                     )
                     continue
-                combos = engine.all_combinations(flat_field_ids)
+                combos = engine.all_combinations(field_lists)
                 for expr, fids in combos:
                     ok, reason = engine.validate(expr)
                     if not ok:
