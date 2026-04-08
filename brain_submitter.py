@@ -27,7 +27,6 @@ import hashlib
 import itertools
 import json
 import logging
-import random
 import re
 import sqlite3
 import sys
@@ -66,56 +65,6 @@ def load_credentials(path: str) -> Dict[str, str]:
             f"'{path}' must contain both 'username' and 'password' keys"
         )
     return creds
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2. DATA FIELD FETCHER  (uses autobrain-sim's authenticated session)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_data_fields(
-    client: BrainClient,
-    instrument_type: str = "EQUITY",
-    region: str = "USA",
-    universe: str = "TOP3000",
-    delay: int = 1,
-    category: str = "",
-) -> List[Dict]:
-    """Return all available data fields matching the given settings."""
-    fields: List[Dict] = []
-    offset, limit = 0, 20
-
-    while True:
-        params: Dict = {
-            "instrumentType": instrument_type,
-            "region":         region,
-            "universe":       universe,
-            "delay":          delay,
-            "language":       "FASTEXPR",
-            "limit":          limit,
-            "offset":         offset,
-        }
-        if category:
-            params["category"] = category
-
-        r = _get_session(client).get(f"{BRAIN_BASE}/data-fields", params=params)
-        if r.status_code == 429:
-            wait = int(r.headers.get("Retry-After", 60))
-            log.warning("Rate limited fetching data fields. Waiting %ds ...", wait)
-            time.sleep(wait)
-            continue
-        if r.status_code == 400:
-            log.error("data-fields 400 error. Response: %s", r.text)
-        r.raise_for_status()
-
-        page = r.json()
-        results = page.get("results", [])
-        fields.extend(results)
-        if len(results) < limit:
-            break
-        offset += limit
-        time.sleep(0.3)  # gentle paging
-
-    log.info("Fetched %d data fields.", len(fields))
-    return fields
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3. AUTH HELPER
@@ -521,101 +470,7 @@ def export_csv(rows: list, path: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 8. CATEGORY ASSIGNMENT PROMPT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def prompt_category_assignment(
-    engines: List[TemplateEngine],
-    categorized_fields: Dict[str, List[Dict]],
-) -> List[List[List[str]]]:
-    """Interactively assign a data category to each placeholder in each template.
-
-    Prints a numbered menu once per placeholder and reads stdin.  Choosing 0
-    uses all fields regardless of category.
-
-    Returns
-    -------
-    List[List[List[str]]]
-        Outer list  — one entry per engine (template).
-        Middle list — one entry per placeholder in that engine.
-        Inner list  — the field IDs for that placeholder.
-        Static templates (no placeholders) get an empty middle list [].
-    """
-    cat_names = list(categorized_fields.keys())
-    # Build field-ID list per category (skip blanks)
-    cat_ids: Dict[str, List[str]] = {
-        cat: [
-            fid for f in fields
-            if (fid := f.get("id") or f.get("fieldId", ""))
-        ]
-        for cat, fields in categorized_fields.items()
-    }
-    all_ids: List[str] = [fid for ids in cat_ids.values() for fid in ids]
-
-    result: List[List[List[str]]] = []
-    for ei, engine in enumerate(engines, 1):
-        if not engine.placeholders:
-            print(f"\nTemplate {ei}: {engine.template}")
-            print("  (no placeholder — will be submitted as-is)")
-            result.append([])
-            continue
-
-        print(f"\nTemplate {ei}: {engine.template}")
-        per_placeholder: List[List[str]] = []
-        for ph in engine.placeholders:
-            print(f"  Assign category for {ph}:")
-            print(f"    0. all fields  ({len(all_ids)} total)")
-            for ci, cat in enumerate(cat_names, 1):
-                print(f"    {ci}. {cat}  ({len(cat_ids[cat])} fields)")
-            while True:
-                try:
-                    raw = input(f"  Enter number [0-{len(cat_names)}]: ").strip()
-                    choice = int(raw)
-                    if 0 <= choice <= len(cat_names):
-                        break
-                    print(f"  Please enter a number between 0 and {len(cat_names)}.")
-                except (ValueError, EOFError):
-                    print("  Invalid input — defaulting to 0 (all fields).")
-                    choice = 0
-                    break
-
-            if choice == 0:
-                pool = all_ids
-                log.info("  %s -> all fields (%d)", ph, len(pool))
-            else:
-                chosen = cat_names[choice - 1]
-                pool = cat_ids[chosen]
-                log.info("  %s -> category '%s' (%d fields)", ph, chosen, len(pool))
-
-            # Ask how many fields to randomly sample from this pool.
-            # 0 = use all (run as normal).
-            print(f"  How many fields to randomly sample from this pool of {len(pool)}?")
-            print(f"  (Enter 0 to use all {len(pool)} fields)")
-            while True:
-                try:
-                    sample_n = int(input("  Sample size [0 = all]: ").strip())
-                    if 0 <= sample_n <= len(pool):
-                        break
-                    print(f"  Please enter a number between 0 and {len(pool)}.")
-                except (ValueError, EOFError):
-                    print("  Invalid input — defaulting to 0 (use all).")
-                    sample_n = 0
-                    break
-
-            if sample_n == 0:
-                per_placeholder.append(pool)
-                log.info("    -> using all %d fields", len(pool))
-            else:
-                sampled = random.sample(pool, sample_n)
-                per_placeholder.append(sampled)
-                log.info("    -> randomly sampled %d / %d fields", sample_n, len(pool))
-
-        result.append(per_placeholder)
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 9. PER-TEMPLATE LANE RUNNER
+# 8. PER-TEMPLATE LANE RUNNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_alpha_details(client, alpha_id: str) -> Optional[Dict]:
@@ -839,14 +694,12 @@ def run(
     delay: int,
     min_sharpe: float,
     min_fitness: float,
-    field_category: str,
     submission_delay: float,
     poll_interval: int,
     timeout: int,
     output_prefix: str,
     db_path: str,
     resume: bool,
-    data_fields_file: Optional[str] = None,
     min_sharpe_low: Optional[float] = None,
 ) -> None:
     client  = build_client(credentials)
@@ -864,13 +717,11 @@ def run(
             min_sharpe=min_sharpe,
             min_fitness=min_fitness,
             min_sharpe_low=min_sharpe_low,
-            field_category=field_category,
             submission_delay=submission_delay,
             poll_interval=poll_interval,
             timeout=timeout,
             output_prefix=output_prefix,
             resume=resume,
-            data_fields_file=data_fields_file,
         )
     finally:
         db.close()
@@ -888,16 +739,14 @@ def _run_inner(
     delay: int,
     min_sharpe: float,
     min_fitness: float,
-    field_category: str,
     submission_delay: float,
     poll_interval: int,
     timeout: int,
     output_prefix: str,
     resume: bool,
-    data_fields_file: Optional[str] = None,
     min_sharpe_low: Optional[float] = None,
 ) -> None:
-    # ── Fetch & enqueue data fields ───────────────────────────────────────────
+    # ── Enqueue templates ─────────────────────────────────────────────────────
     if not resume or not db.pending():
         if not resume:
             existing = len(db.pending())
@@ -908,90 +757,29 @@ def _run_inner(
                     existing,
                 )
                 db.clear()
-        if data_fields_file:
-            log.info("Loading data fields from %s ...", data_fields_file)
-            with open(data_fields_file) as _f:
-                raw = json.load(_f)
-            # Detect format: categorized dict vs legacy flat list
-            if isinstance(raw, dict):
-                categorized_fields = raw
-                flat_fields: List[Dict] = [
-                    f for cat_fields in raw.values() for f in cat_fields
-                ]
-                total_loaded = sum(len(v) for v in raw.values())
-                log.info(
-                    "Loaded %d fields across %d categories from cache.",
-                    total_loaded, len(raw),
-                )
-            else:
-                categorized_fields = None
-                flat_fields = raw
-                log.info("Loaded %d data fields from cache.", len(flat_fields))
-        else:
-            log.info("Fetching data fields from BRAIN ...")
-            flat_fields = get_data_fields(
-                client,
-                instrument_type=instrument_type,
-                region=region,
-                universe=universe,
-                delay=delay,
-                category=field_category,
-            )
-            categorized_fields = None
 
-        flat_field_ids: List[str] = [
-            fid for f in flat_fields
-            if (fid := f.get("id") or f.get("fieldId", ""))
-        ]
-
-        # Prompt user to assign categories to placeholders when categorized
-        # data is available.
-        if categorized_fields is not None:
-            field_lists_per_engine = prompt_category_assignment(
-                engines, categorized_fields
-            )
-        else:
-            # Legacy / no-category mode: use flat list for every placeholder
-            field_lists_per_engine = [
-                [flat_field_ids] * len(engine.placeholders) if engine.placeholders else []
-                for engine in engines
-            ]
-
-        log.info(
-            "Enqueueing combinations for %d template(s) x %d fields ...",
-            len(engines), len(flat_field_ids),
-        )
         pending_rows: List[Tuple[str, str, int]] = []
-        for tidx, (engine, field_lists) in enumerate(
-            zip(engines, field_lists_per_engine)
-        ):
+        for tidx, engine in enumerate(engines):
             if engine.mode == "static":
-                combos = engine.all_combinations([])
-            else:
-                # Warn when the cartesian product is very large
-                n_combos = 1
-                for fl in field_lists:
-                    n_combos *= len(fl)
-                if len(engine.placeholders) > 1 and n_combos > 1000:
-                    log.warning(
-                        "Template '%s': %d combinations is very large. "
-                        "Consider assigning a narrower category.",
-                        engine.template[:60], n_combos,
-                    )
-                combos = engine.all_combinations(field_lists)
-            for expr, fids in combos:
+                expr = engine.template
                 ok, reason = engine.validate(expr)
-                if not ok:
-                    log.debug("Skip %s: %s", fids, reason)
-                    continue
-                pending_rows.append(
-                    (expr, "|".join(fids) if fids else "static", tidx)
+                if ok:
+                    pending_rows.append((expr, "static", tidx))
+                else:
+                    log.warning(
+                        "Template %d skipped (%s): %s", tidx + 1, expr[:60], reason
+                    )
+            else:
+                log.warning(
+                    "Template %d has placeholder(s) %s — write the full "
+                    "expression without {DATA} placeholders. Skipping.",
+                    tidx + 1, engine.placeholders,
                 )
-        log.info("Inserting %d expressions into DB ...", len(pending_rows))
+
         db.bulk_upsert_pending(pending_rows)
-        log.info("Enqueued %d expressions total.", len(db.pending()))
+        log.info("Enqueued %d expression(s).", len(pending_rows))
     else:
-        log.info("Resuming -- %d pending expressions in DB.", len(db.pending()))
+        log.info("Resuming — %d pending expression(s) in DB.", len(db.pending()))
 
     # ── Simulation settings ───────────────────────────────────────────────────
     sim_settings: Dict = {
@@ -1087,13 +875,6 @@ def main() -> None:
         ),
     )
     p.add_argument(
-        "--data-fields-file", default=None,
-        help=(
-            "Path to a cached JSON file of data fields produced by "
-            "brain_data_fetcher.py. Skips the API fetch when provided."
-        ),
-    )
-    p.add_argument(
         "--credentials", default="credentials.json",
         help=(
             "Path to JSON file with {username, password}. "
@@ -1131,10 +912,6 @@ def main() -> None:
     p.add_argument(
         "--fitness", default=1.0, type=float,
         help="Minimum fitness score to pass",
-    )
-    p.add_argument(
-        "--category", default="",
-        help="Filter data fields by category (e.g. 'fundamental')",
     )
     p.add_argument(
         "--submission-delay", default=2.0, type=float,
@@ -1232,14 +1009,12 @@ def main() -> None:
         min_sharpe       = args.sharpe,
         min_sharpe_low   = args.sharpe_low,
         min_fitness      = args.fitness,
-        field_category   = args.category,
         submission_delay = args.submission_delay,
         poll_interval    = args.poll_interval,
         timeout          = args.timeout,
         output_prefix    = args.output,
         db_path          = args.db,
         resume           = args.resume,
-        data_fields_file = args.data_fields_file,
     )
 
 
