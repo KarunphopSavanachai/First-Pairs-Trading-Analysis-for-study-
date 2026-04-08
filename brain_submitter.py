@@ -38,9 +38,6 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from brain_client import BrainClient
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -507,128 +504,21 @@ COLS = [
 
 
 def export_csv(rows: list, path: str) -> None:
-    with open(path, "w", newline="") as f:
+    """Append passing alphas to a persistent CSV file.
+
+    Creates the file with a header row if it does not exist yet;
+    appends rows without repeating the header on subsequent runs.
+    """
+    import os
+    write_header = not os.path.isfile(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=COLS, extrasaction="ignore")
-        w.writeheader()
+        if write_header:
+            w.writeheader()
         for r in rows:
             w.writerow(dict(r))
-    log.info("CSV saved -> %s", path)
+    log.info("Appended %d passing alpha(s) -> %s", len(rows), path)
 
-
-def export_excel(
-    rows: list,
-    path: str,
-    min_sharpe: float,
-    min_fitness: float,
-    min_sharpe_low: Optional[float] = None,
-) -> None:
-    wb = Workbook()
-
-    # Sheet 1: Passed alphas
-    ws = wb.active
-    ws.title = "Passed Alphas"
-    _write_sheet(
-        ws, [r for r in rows if r["passed"]],
-        min_sharpe, min_fitness, min_sharpe_low,
-    )
-
-    # Sheet 2: All results
-    ws2 = wb.create_sheet("All Results")
-    _write_sheet(ws2, rows, min_sharpe, min_fitness, min_sharpe_low)
-
-    wb.save(path)
-    log.info("Excel saved -> %s", path)
-
-
-def _write_sheet(
-    ws, rows: list, min_sharpe: float, min_fitness: float,
-    min_sharpe_low: Optional[float] = None,
-) -> None:
-    HEADERS = [
-        "Expression", "Field ID", "Sharpe", "Fitness",
-        "Turnover", "Ann. Return", "Max Drawdown",
-        "Alpha ID", "Sim URL", "Finished At",
-    ]
-    COL_WIDTHS = [55, 22, 10, 10, 10, 12, 14, 28, 50, 22]
-
-    # ── Header row ───────────────────────────────────────────────────────────
-    header_fill = PatternFill("solid", start_color="1F4E79")
-    header_font = Font(color="FFFFFF", bold=True, name="Arial", size=10)
-    for ci, (h, w) in enumerate(zip(HEADERS, COL_WIDTHS), 1):
-        cell = ws.cell(row=1, column=ci, value=h)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        ws.column_dimensions[get_column_letter(ci)].width = w
-    ws.row_dimensions[1].height = 22
-    ws.freeze_panes = "A2"
-
-    # ── Data rows ─────────────────────────────────────────────────────────────
-    green_fill  = PatternFill("solid", start_color="E2EFDA")   # pass
-    yellow_fill = PatternFill("solid", start_color="FFF2CC")   # marginal
-    red_fill    = PatternFill("solid", start_color="FCE4D6")   # fail
-    num_font    = Font(name="Arial", size=9)
-    txt_font    = Font(name="Arial", size=9)
-    mono_font   = Font(name="Courier New", size=8)
-
-    for ri, row in enumerate(rows, 2):
-        sharpe  = row["sharpe"]  or 0.0
-        fitness = row["fitness"] or 0.0
-        passed  = bool(row["passed"])
-
-        near_upper = sharpe >= min_sharpe * 0.8
-        near_lower = min_sharpe_low is not None and sharpe <= min_sharpe_low * 0.8
-        if passed:
-            row_fill = green_fill
-        elif (near_upper or near_lower) and fitness >= min_fitness * 0.8:
-            row_fill = yellow_fill
-        else:
-            row_fill = red_fill
-
-        values = [
-            row["expression"],
-            row["field_id"],
-            row["sharpe"],
-            row["fitness"],
-            row["turnover"],
-            row["returns"],
-            row["drawdown"],
-            row["alpha_id"],
-            row["sim_id"],
-            row["finished_at"],
-        ]
-        for ci, val in enumerate(values, 1):
-            cell = ws.cell(row=ri, column=ci, value=val)
-            cell.fill = row_fill
-            if ci == 1:
-                cell.font = mono_font
-            elif ci in (3, 4, 5, 6, 7):
-                cell.font = num_font
-                cell.number_format = "0.000"
-                cell.alignment = Alignment(horizontal="right")
-            else:
-                cell.font = txt_font
-
-    # ── Summary row ───────────────────────────────────────────────────────────
-    # Capture last_data_row BEFORE writing the summary so formulas are correct.
-    if rows:
-        last_data_row = ws.max_row
-        sr = last_data_row + 2
-        ws.cell(row=sr, column=1, value="SUMMARY").font = Font(bold=True, name="Arial")
-        ws.cell(row=sr, column=2, value=f"{len(rows)} alphas")
-        ws.cell(row=sr, column=3, value=f"=MAX(C2:C{last_data_row})")
-        ws.cell(row=sr, column=4, value=f"=MAX(D2:D{last_data_row})")
-
-        sharpe_desc = f">= {min_sharpe}"
-        if min_sharpe_low is not None:
-            sharpe_desc += f" or <= {min_sharpe_low}"
-        ws.cell(
-            row=ws.max_row + 2, column=1,
-            value=(
-                f"Filters applied:  Sharpe {sharpe_desc}"
-                f"  |  min Fitness >= {min_fitness}"
-            ),
-        ).font = Font(italic=True, color="555555", name="Arial", size=8)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 8. CATEGORY ASSIGNMENT PROMPT
@@ -735,7 +625,7 @@ def fetch_alpha_details(client, alpha_id: str) -> Optional[Dict]:
     fitness, turnover, etc.) are only available at this separate endpoint.
     """
     url = f"{BRAIN_BASE}/alphas/{alpha_id}"
-    for _attempt in range(3):
+    for attempt in range(3):
         try:
             r = _get_session(client).get(url)
             if r.status_code == 429:
@@ -748,8 +638,11 @@ def fetch_alpha_details(client, alpha_id: str) -> Optional[Dict]:
             r.raise_for_status()
             return r.json()
         except Exception as exc:
-            log.warning("Could not fetch alpha details for %s: %s", alpha_id, exc)
-            return None
+            log.warning(
+                "Could not fetch alpha details for %s (attempt %d/3): %s",
+                alpha_id, attempt + 1, exc,
+            )
+            # fall through to next attempt
     return None
 
 
@@ -771,7 +664,7 @@ def _record_result(
     # The progress-URL response often omits IS stats; fetch the full alpha record
     # from /alphas/{id} whenever all metrics come back as None.
     if client and alpha_id and all(v is None for v in metrics.values()):
-        log.debug("Fetching IS stats from /alphas/%s ...", alpha_id)
+        log.info("Fetching IS stats from /alphas/%s ...", alpha_id)
         full = fetch_alpha_details(client, alpha_id)
         if full:
             metrics = parse_metrics(full)
@@ -1068,36 +961,18 @@ def _run_inner(
                 log.error("Lane %d raised an unhandled exception: %s", tidx + 1, exc)
 
     # ── Export ────────────────────────────────────────────────────────────────
-    ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
-    all_rows   = db.all_done()
-    csv_path   = f"{output_prefix}_{ts}.csv"
-    excel_path = f"{output_prefix}_{ts}.xlsx"
+    all_rows    = db.all_done()
+    passed_rows = [r for r in all_rows if r["passed"]]
+    csv_path    = f"{output_prefix}.csv"   # fixed name — appended each run
 
-    export_csv(all_rows, csv_path)
-    export_excel(all_rows, excel_path, min_sharpe, min_fitness, min_sharpe_low)
+    if passed_rows:
+        export_csv(passed_rows, csv_path)
+    else:
+        log.info("No passing alphas this run — %s not updated.", csv_path)
 
-    # Per-criterion files — one for each threshold independently
-    def _sharpe_ok(s):
-        v = s or 0.0
-        return v >= min_sharpe or (min_sharpe_low is not None and v <= min_sharpe_low)
-
-    sharpe_rows  = [r for r in all_rows if _sharpe_ok(r["sharpe"])]
-    fitness_rows = [r for r in all_rows if (r["fitness"] or 0.0) >= min_fitness]
-
-    if sharpe_rows:
-        sharpe_path = f"sharpe_passed_{ts}.xlsx"
-        export_excel(sharpe_rows, sharpe_path, min_sharpe, min_fitness, min_sharpe_low)
-        log.info("Sharpe-passed  -> %s  (%d alphas)", sharpe_path, len(sharpe_rows))
-
-    if fitness_rows:
-        fitness_path = f"fitness_passed_{ts}.xlsx"
-        export_excel(fitness_rows, fitness_path, min_sharpe, min_fitness, min_sharpe_low)
-        log.info("Fitness-passed -> %s  (%d alphas)", fitness_path, len(fitness_rows))
-
-    passed_count = sum(1 for r in all_rows if r["passed"])
     log.info(
-        "Done. %d/%d alphas passed all filters. Results: %s | %s",
-        passed_count, len(all_rows), csv_path, excel_path,
+        "Done. %d/%d alphas passed filters. Results: %s",
+        len(passed_rows), len(all_rows), csv_path,
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1202,7 +1077,11 @@ def main() -> None:
     )
     p.add_argument(
         "--output", default="brain_results",
-        help="Output file prefix (timestamp appended)",
+        help=(
+            "Output file prefix. Passing alphas are appended to "
+            "{prefix}.csv each run, so all results accumulate in one file. "
+            "Use a different prefix per category to keep them separate."
+        ),
     )
     p.add_argument(
         "--db", default="brain_runs.db",
