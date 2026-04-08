@@ -636,7 +636,9 @@ def fetch_alpha_details(client, alpha_id: str) -> Optional[Dict]:
                 time.sleep(wait)
                 continue
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            log.debug("Alpha details for %s: %s", alpha_id, data)
+            return data
         except Exception as exc:
             log.warning(
                 "Could not fetch alpha details for %s (attempt %d/3): %s",
@@ -644,6 +646,41 @@ def fetch_alpha_details(client, alpha_id: str) -> Optional[Dict]:
             )
             # fall through to next attempt
     return None
+
+
+def _parse_is_metrics(raw: Dict) -> Dict:
+    """Parse IS stats from a /alphas/{id} response.
+
+    Handles multiple nesting patterns seen in the BRAIN API:
+      raw["is"]["sharpe"], raw["is"]["stats"]["sharpe"],
+      raw["stats"]["sharpe"], raw["sharpe"], etc.
+    """
+    def _candidates(key: str, *aliases: str) -> Optional[float]:
+        all_keys = (key,) + aliases
+        # search these sub-dicts in priority order
+        sources = [
+            raw.get("is") or {},
+            (raw.get("is") or {}).get("stats") or {},
+            raw.get("stats") or {},
+            raw,
+        ]
+        for src in sources:
+            for k in all_keys:
+                v = src.get(k)
+                if v is not None:
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        pass
+        return None
+
+    return {
+        "sharpe":   _candidates("sharpe",   "sharpeRatio"),
+        "fitness":  _candidates("fitness",  "fitnessScore"),
+        "turnover": _candidates("turnover"),
+        "returns":  _candidates("returns",  "annualReturn"),
+        "drawdown": _candidates("maxDrawdown", "drawdown"),
+    }
 
 
 def _record_result(
@@ -658,18 +695,29 @@ def _record_result(
     client=None,
 ) -> None:
     """Parse a completed simulation result and persist it to the DB."""
-    metrics  = parse_metrics(result)
     alpha_id = result.get("id") or result.get("alphaId") or ""
 
-    # The progress-URL response often omits IS stats; fetch the full alpha record
-    # from /alphas/{id} whenever all metrics come back as None.
-    if client and alpha_id and all(v is None for v in metrics.values()):
+    # Always fetch the full alpha record from /alphas/{id} — the progress-URL
+    # response only contains {"status": "COMPLETE", "id": "..."} with no stats.
+    metrics = None
+    if client and alpha_id:
         log.info("Fetching IS stats from /alphas/%s ...", alpha_id)
         full = fetch_alpha_details(client, alpha_id)
         if full:
-            metrics = parse_metrics(full)
-    sharpe   = metrics.get("sharpe")  or 0.0
-    fitness  = metrics.get("fitness") or 0.0
+            metrics = _parse_is_metrics(full)
+            if all(v is None for v in metrics.values()):
+                log.warning(
+                    "Alpha %s: /alphas/ response had no parseable metrics. "
+                    "Raw keys: %s", alpha_id, list(full.keys())
+                )
+                metrics = None
+
+    # Fall back to parsing the simulation result itself (older API versions)
+    if metrics is None:
+        metrics = parse_metrics(result)
+
+    sharpe  = metrics.get("sharpe")  if metrics.get("sharpe")  is not None else 0.0
+    fitness = metrics.get("fitness") if metrics.get("fitness") is not None else 0.0
     sharpe_ok = sharpe >= min_sharpe or (
         min_sharpe_low is not None and sharpe <= min_sharpe_low
     )
