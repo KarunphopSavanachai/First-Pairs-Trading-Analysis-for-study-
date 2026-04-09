@@ -211,6 +211,7 @@ class StateDB:
     """
 
     def __init__(self, db_path: str = "brain_runs.db"):
+        self._lock = threading.Lock()
         self.conn: Optional[sqlite3.Connection] = sqlite3.connect(
             db_path, check_same_thread=False
         )
@@ -228,9 +229,10 @@ class StateDB:
 
     def close(self) -> None:
         """Explicitly close the database connection."""
-        if self.conn is not None:
-            self.conn.close()
-            self.conn = None
+        with self._lock:
+            if self.conn is not None:
+                self.conn.close()
+                self.conn = None
 
     def __del__(self) -> None:
         self.close()
@@ -239,35 +241,39 @@ class StateDB:
 
     def upsert_pending(self, expr: str, field_id: str) -> None:
         h = _sha(expr)
-        self.conn.execute(
-            """INSERT OR IGNORE INTO runs (expr_hash, expression, field_id, status)
-               VALUES (?, ?, ?, 'pending')""",
-            (h, expr, field_id),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO runs (expr_hash, expression, field_id, status)
+                   VALUES (?, ?, ?, 'pending')""",
+                (h, expr, field_id),
+            )
+            self.conn.commit()
 
     def bulk_upsert_pending(self, rows: List[Tuple[str, str, int]]) -> None:
         """Insert many (expr, field_id, template_idx) triples in one transaction."""
-        self.conn.executemany(
-            """INSERT OR IGNORE INTO runs
-                   (expr_hash, expression, field_id, status, template_idx)
-               VALUES (?, ?, ?, 'pending', ?)""",
-            [(_sha(expr), expr, field_id, tidx) for expr, field_id, tidx in rows],
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.executemany(
+                """INSERT OR IGNORE INTO runs
+                       (expr_hash, expression, field_id, status, template_idx)
+                   VALUES (?, ?, ?, 'pending', ?)""",
+                [(_sha(expr), expr, field_id, tidx) for expr, field_id, tidx in rows],
+            )
+            self.conn.commit()
 
     def clear(self) -> None:
         """Delete all rows — wipes stale state before a fresh (non-resume) run."""
-        self.conn.execute("DELETE FROM runs")
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute("DELETE FROM runs")
+            self.conn.commit()
 
     def mark_submitted(self, expr: str, progress_url: str) -> None:
-        self.conn.execute(
-            """UPDATE runs SET status='submitted', sim_id=?, submitted_at=?
-               WHERE expr_hash=?""",
-            (progress_url, _now(), _sha(expr)),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """UPDATE runs SET status='submitted', sim_id=?, submitted_at=?
+                   WHERE expr_hash=?""",
+                (progress_url, _now(), _sha(expr)),
+            )
+            self.conn.commit()
 
     def mark_done(
         self,
@@ -276,61 +282,68 @@ class StateDB:
         passed: bool,
         alpha_id: str = "",
     ) -> None:
-        self.conn.execute(
-            """UPDATE runs
-               SET status='done', sharpe=?, fitness=?, turnover=?,
-                   returns=?, drawdown=?, passed=?, alpha_id=?, finished_at=?
-               WHERE expr_hash=?""",
-            (
-                metrics.get("sharpe"),
-                metrics.get("fitness"),
-                metrics.get("turnover"),
-                metrics.get("returns"),
-                metrics.get("drawdown"),
-                1 if passed else 0,
-                alpha_id,
-                _now(),
-                _sha(expr),
-            ),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """UPDATE runs
+                   SET status='done', sharpe=?, fitness=?, turnover=?,
+                       returns=?, drawdown=?, passed=?, alpha_id=?, finished_at=?
+                   WHERE expr_hash=?""",
+                (
+                    metrics.get("sharpe"),
+                    metrics.get("fitness"),
+                    metrics.get("turnover"),
+                    metrics.get("returns"),
+                    metrics.get("drawdown"),
+                    1 if passed else 0,
+                    alpha_id,
+                    _now(),
+                    _sha(expr),
+                ),
+            )
+            self.conn.commit()
 
     def mark_failed(self, expr: str, error: str) -> None:
-        self.conn.execute(
-            """UPDATE runs SET status='failed', error=?, finished_at=?
-               WHERE expr_hash=?""",
-            (error, _now(), _sha(expr)),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """UPDATE runs SET status='failed', error=?, finished_at=?
+                   WHERE expr_hash=?""",
+                (error, _now(), _sha(expr)),
+            )
+            self.conn.commit()
 
     # ── Read methods ──────────────────────────────────────────────────────────
 
     def pending(self) -> List[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM runs WHERE status='pending' ORDER BY rowid"
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM runs WHERE status='pending' ORDER BY rowid"
+            ).fetchall()
 
     def submitted(self) -> List[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM runs WHERE status='submitted'"
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM runs WHERE status='submitted'"
+            ).fetchall()
 
     def all_done(self) -> List[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM runs WHERE status='done' ORDER BY sharpe DESC"
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM runs WHERE status='done' ORDER BY sharpe DESC"
+            ).fetchall()
 
     def pending_for_template(self, template_idx: int) -> List[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM runs WHERE status='pending' AND template_idx=? ORDER BY rowid",
-            (template_idx,),
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM runs WHERE status='pending' AND template_idx=? ORDER BY rowid",
+                (template_idx,),
+            ).fetchall()
 
     def submitted_for_template(self, template_idx: int) -> List[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT * FROM runs WHERE status='submitted' AND template_idx=? ORDER BY rowid",
-            (template_idx,),
-        ).fetchall()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM runs WHERE status='submitted' AND template_idx=? ORDER BY rowid",
+                (template_idx,),
+            ).fetchall()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. TEMPLATE ENGINE
@@ -842,14 +855,8 @@ def _run_inner(
     # ── Enqueue templates ─────────────────────────────────────────────────────
     if not resume or not db.pending():
         if not resume:
-            existing = len(db.pending())
-            if existing:
-                log.info(
-                    "Clearing %d stale row(s) from a previous run "
-                    "(pass --resume to continue that run instead).",
-                    existing,
-                )
-                db.clear()
+            db.clear()
+            log.info("Starting fresh run (previous data cleared).")
 
         # Load data fields — prompt for category+sample when categorised
         categorized_fields: Optional[Dict[str, List[Dict]]] = None
