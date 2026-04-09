@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Local runtime artifacts
+brain_runs.db
+brain_submitter.log
+brain_results_*.csv
+brain_results_*.xlsx
+
+# Credentials (never commit these)
+credentials.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
